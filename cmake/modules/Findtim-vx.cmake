@@ -29,27 +29,36 @@ if(TFLITE_ENABLE_NODE_TRACE)
   set(TIM_VX_ENABLE_NODE_TRACE "ON")
 endif()
 if((NOT DEFINED TIM_VX_INSTALL))
-  if(TFLITE_ENABLE_MULTI_DEVICE AND (NOT EXTERNAL_VIV_SDK))
-    message(FATAL_ERROR "FATAL: multi device only suppot 40 bit driver,
+  if(DEFINED ANDROID_ROOT)
+    message("=== Building with TIM_VX_LIBRIRIES from android image ===")
+    include_directories(${ANDROID_ROOT}/vendor/nxp-opensource/tim-vx-imx/include)
+    list(APPEND VX_DELEGATE_DEPENDENCIES ${ANDROID_ROOT}/out/target/product/evk_8mp/symbols/vendor/lib64/libtim-vx.so)
+    if(${TIM_VX_ENABLE_NODE_TRACE})
+      list(APPEND VX_DELEGATE_DEPENDENCIES ${ANDROID_ROOT}/out/target/product/evk_8mp/symbols/vendor/lib64/libjsoncpp.so)
+    endif()
+  else()
+    if(TFLITE_ENABLE_MULTI_DEVICE AND (NOT EXTERNAL_VIV_SDK))
+      message(FATAL_ERROR "FATAL: multi device only suppot 40 bit driver,
                                 please assign driver location with EXTERNAL_VIV_SDK")
+    endif()
+    include(FetchContent)
+    FetchContent_Declare(
+      tim-vx
+      GIT_REPOSITORY https://github.com/VeriSilicon/TIM-VX.git
+      GIT_TAG main
+    )
+    FetchContent_GetProperties(tim-vx)
+    if(NOT tim-vx_POPULATED)
+      FetchContent_Populate(tim-vx)
+    endif()
+    include_directories(${tim-vx_SOURCE_DIR}/include)
+    add_subdirectory("${tim-vx_SOURCE_DIR}"
+                     "${tim-vx_BINARY_DIR}")
+    if(${TIM_VX_ENABLE_NODE_TRACE})
+      list(APPEND VX_DELEGATE_DEPENDENCIES ${tim-vx_BINARY_DIR}/_deps/jsoncpp-build/src/lib_json/libjsoncpp.so)
+    endif()
+    # list(APPEND VX_DELEGATE_DEPENDENCIES tim-vx)
   endif()
-  include(FetchContent)
-  FetchContent_Declare(
-    tim-vx
-    GIT_REPOSITORY https://github.com/VeriSilicon/TIM-VX.git
-    GIT_TAG main
-  )
-  FetchContent_GetProperties(tim-vx)
-  if(NOT tim-vx_POPULATED)
-    FetchContent_Populate(tim-vx)
-  endif()
-  include_directories(${tim-vx_SOURCE_DIR}/include)
-  add_subdirectory("${tim-vx_SOURCE_DIR}"
-                   "${tim-vx_BINARY_DIR}")
-  if(${TIM_VX_ENABLE_NODE_TRACE})
-    list(APPEND VX_DELEGATE_DEPENDENCIES ${tim-vx_BINARY_DIR}/_deps/jsoncpp-build/src/lib_json/libjsoncpp.so)
-  endif()
-  # list(APPEND VX_DELEGATE_DEPENDENCIES tim-vx)
 else()
   message("=== Building with TIM_VX_LIBRIRIES from ${TIM_VX_INSTALL} ===")
   include_directories(${TIM_VX_INSTALL}/include)

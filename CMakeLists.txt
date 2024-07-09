@@ -79,7 +79,7 @@ if(ANDROID_TOOLCHAIN)
 endif()
 
 target_link_libraries(vx_delegate ${VX_DELEGATE_DEPENDENCIES})
-if((NOT DEFINED TIM_VX_INSTALL))
+if((NOT DEFINED TIM_VX_INSTALL) AND (NOT DEFINED ANDROID_ROOT))
 target_link_libraries(vx_delegate -Wl,--whole-archive tim-vx)
 endif()
 add_library(vx_custom_op STATIC ${VX_CUSTOM_OP_SRCS})
