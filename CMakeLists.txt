@@ -23,6 +23,19 @@ cmake_minimum_required(VERSION 3.16)
 option(TFLITE_ENABLE_MULTI_DEVICE       "Enable multi devices support"          OFF)
 option(TFLITE_ENABLE_OPTIMIZE           "Enable optimize tiny yolov4"           OFF)
 option(TFLITE_ENABLE_NODE_TRACE         "Enable node trace"                     OFF)
+option(BUILD_FOR_LITERT			"Configure delegate build for LiteRT"	OFF)
+
+if(${BUILD_FOR_LITERT})
+  set(TFLITE_GIT_REPOSITORY "https://github.com/nxp-imx/litert-imx")
+  set(TFLITE_GIT_TAG "lf-6.12.20_2.0.0")
+  set(TFLITE_SUB_PATH "tflite")
+  set(VX_DELEGATE_TARGET "litert_vx_delegate")
+else()
+  set(TFLITE_GIT_REPOSITORY "https://github.com/nxp-imx/tensorflow-imx")
+  set(TFLITE_SUB_PATH "tensorflow/lite")
+  set(TFLITE_GIT_TAG "lf-6.12.20_2.0.0")
+  set(VX_DELEGATE_TARGET "vx_delegate")
+endif()
 
 if(TFLITE_ENABLE_OPTIMIZE)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DVSI_FEAT_OP_CUSTOM_TINY_YOLOV4_POSTPROCESS -DENABLE_TENSOR_CACHE")
@@ -69,7 +82,10 @@ if(TFLITE_ENABLE_NODE_TRACE)
   ADD_DEFINITIONS(-DNODE_TRACE_DB_MODE)
 endif()
 
-add_library(vx_delegate SHARED ${VX_DELEGATES_SRCS})
+add_library(${VX_DELEGATE_TARGET} SHARED ${VX_DELEGATES_SRCS})
+include_directories(
+    $<TARGET_PROPERTY:TensorFlow::tensorflow-lite,INCLUDE_DIRECTORIES>
+)
 
 list(APPEND VX_CUSTOM_OP_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/vsi_npu_custom_op.cc
@@ -78,14 +94,14 @@ if(ANDROID_TOOLCHAIN)
   list(APPEND VX_DELEGATE_DEPENDENCIES log)
 endif()
 
-target_link_libraries(vx_delegate ${VX_DELEGATE_DEPENDENCIES})
+target_link_libraries(${VX_DELEGATE_TARGET} ${VX_DELEGATE_DEPENDENCIES})
 if((NOT DEFINED TIM_VX_INSTALL) AND (NOT DEFINED ANDROID_ROOT))
-target_link_libraries(vx_delegate -Wl,--whole-archive tim-vx)
+target_link_libraries(${VX_DELEGATE_TARGET} -Wl,--whole-archive tim-vx)
 endif()
 add_library(vx_custom_op STATIC ${VX_CUSTOM_OP_SRCS})
 target_include_directories(vx_custom_op PUBLIC ${PROJECT_SOURCE_DIR})
 target_link_libraries(vx_custom_op TensorFlow::tensorflow-lite)
-add_dependencies(vx_custom_op vx_delegate)
+add_dependencies(vx_custom_op ${VX_DELEGATE_TARGET})
 
 set_target_properties(benchmark_model PROPERTIES INTERFACE_LINK_LIBRARIES vx_custom_op)
 set_target_properties(label_image PROPERTIES INTERFACE_LINK_LIBRARIES vx_custom_op)
