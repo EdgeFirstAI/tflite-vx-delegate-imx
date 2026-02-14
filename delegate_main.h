@@ -28,12 +28,14 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 #include <fstream>
 
 #include "absl/types/optional.h"
 #include "vsi_npu_custom_op.h"
+#include "dmabuf_manager.h"
 #include "tensorflow/lite/builtin_op_data.h"
 #include "tensorflow/lite/builtin_ops.h"
 #include "tensorflow/lite/context.h"
@@ -66,6 +68,10 @@ typedef struct {
   bool error_during_prepare;
   // Report error during invoke.
   bool error_during_invoke;
+  // Enable DMA-BUF zero-copy support
+  bool enable_dmabuf;
+  // Path to dma_heap device (nullptr for auto-detect)
+  const char* dma_heap_path;
 } VxDelegateOptions;
 
 #ifdef NODE_TRACE_DB_MODE
@@ -95,6 +101,13 @@ struct DerivedDelegateData {
     bool allow_cache_mode;
     int32_t device_id;
     std::string cache_path;
+    // DMA-BUF support
+    bool enable_dmabuf;
+    std::string dma_heap_path;
+    // Shared DmaBufManager for all delegate instances
+    std::shared_ptr<DmaBufManager> dmabuf_manager;
+    // Flag for graph invalidation (set by VxDelegateInvalidateGraph)
+    bool needs_invalidation;
 };
 
 TfLiteDelegate* VxDelegate(const VxDelegateOptions* options);
@@ -131,6 +144,18 @@ class Delegate {
   std::map<int32_t, std::shared_ptr<tim::vx::Tensor>>& GetTensors() {
     return tensors_;
   }
+
+  // DMA-BUF support
+  DmaBufManager* GetDmaBufManager() const { return dmabuf_manager_.get(); }
+  bool IsDmaBufEnabled() const { return dmabuf_enabled_; }
+  void SetDmaBufManager(std::shared_ptr<DmaBufManager> mgr);
+  void SetParentDelegate(DerivedDelegateData* parent) { parent_delegate_ = parent; }
+
+  // Buffer cycling support
+  TfLiteStatus SwapDmaBufTensor(int tensor_index, int new_fd);
+  TfLiteStatus InvalidateGraph();
+  bool IsGraphCompiled() const { return compiled_; }
+  bool CheckAndClearInvalidation();
 
   std::shared_ptr<tim::vx::Operation> postproc_;
   std::map<std::shared_ptr<tim::vx::Tensor>,std::shared_ptr<tim::vx::Tensor>> map_BroadcastTo;
@@ -173,6 +198,20 @@ class Delegate {
 
   size_t nbg_size_;
   std::fstream fs_;
+
+  // DMA-BUF support (shared across delegate instances)
+  std::shared_ptr<DmaBufManager> dmabuf_manager_;
+  bool dmabuf_enabled_;
+  DerivedDelegateData* parent_delegate_;
+
+  // Buffer cycling: layout-inferred tensors for SwapHandle
+  // Maps tensor_index -> layout-inferred TIM-VX tensor (for swapping)
+  std::map<int, std::shared_ptr<tim::vx::Tensor>> dmabuf_swap_tensors_;
+  // Maps tensor_index -> currently active fd (to detect changes)
+  std::map<int, int> dmabuf_active_fds_;
+
+  // Log zero-copy status once per tensor (avoid per-frame spam)
+  std::set<int> dmabuf_zerocopy_logged_;
 };
 
 }  // namespace delegate
