@@ -35,6 +35,7 @@
 #include "op_map.h"
 #include "utils.h"
 #include "vx_delegate_dmabuf.h"
+#include "camera_adaptor/camera_adaptor.h"
 #include "tensorflow/lite/minimal_logging.h"
 #include "tensorflow/lite/context_util.h"
 #include "tensorflow/lite/kernels/internal/reference/reference_ops.h"
@@ -620,11 +621,34 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     graph_ = context_->CreateGraph();
 
     // Create input tensors
+    // When CameraAdaptor is configured for a tensor:
+    // - Create the model's expected tensor as TRANSIENT (Slice will write to it)
+    // - CameraAdaptor creates the actual INPUT tensor with camera format
     for (int tensor_idx : op_data.subgraph_inputs) {
       if (-1 != tensor_idx && tensors_[tensor_idx].get() == nullptr) {
         const auto tensor = &(context->tensors[tensor_idx]);
+
+        // Check if CameraAdaptor is configured for this tensor
+        bool has_camera_adaptor = false;
+        if (parent_delegate_) {
+          auto config_it = parent_delegate_->camera_adaptor_configs.find(tensor_idx);
+          if (config_it != parent_delegate_->camera_adaptor_configs.end()) {
+            edgefirst::camera_adaptor::CameraAdaptor adaptor(config_it->second);
+            has_camera_adaptor = adaptor.RequiresConversion();
+          }
+        }
+
+        // If CameraAdaptor is configured, create as TRANSIENT (Slice outputs to it)
+        if (has_camera_adaptor) {
+          tensors_[tensor_idx] =
+              CreateTensor(graph_, tensor, tim::vx::TensorAttribute::TRANSIENT, {});
+          TFLITE_LOG(TFLITE_LOG_INFO,
+                     "Created TRANSIENT tensor %d for CameraAdaptor output", tensor_idx);
+          continue;
+        }
+
 #ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
-        // Check if this input tensor has a registered DMA-BUF
+        // Check if this input tensor has a registered DMA-BUF (no CameraAdaptor case)
         TFLITE_LOG(TFLITE_LOG_INFO, "Checking input tensor %d: dmabuf_manager_=%p, dmabuf_enabled_=%d",
                    tensor_idx, dmabuf_manager_.get(), dmabuf_enabled_);
         if (dmabuf_manager_ && dmabuf_enabled_) {
@@ -636,7 +660,7 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
             if (fd >= 0) {
               tensors_[tensor_idx] = CreateTensorWithDmaBuf(
                   graph_, tensor, tim::vx::TensorAttribute::INPUT, {}, fd);
-              TFLITE_LOG_PROD(TFLITE_LOG_INFO, 
+              TFLITE_LOG_PROD(TFLITE_LOG_INFO,
                          "Created dmabuf-backed input tensor %d (fd=%d)", tensor_idx, fd);
               continue;
             }
@@ -645,6 +669,112 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
 #endif
         tensors_[tensor_idx] =
             CreateTensor(graph_, tensor, tim::vx::TensorAttribute::INPUT, {});
+      }
+    }
+
+    // Inject camera adaptor preprocessing if configured
+    // This creates the actual INPUT tensor and connects it to the TRANSIENT tensor via Slice
+    if (parent_delegate_) {
+      for (int tensor_idx : op_data.subgraph_inputs) {
+        auto config_it = parent_delegate_->camera_adaptor_configs.find(tensor_idx);
+        if (config_it != parent_delegate_->camera_adaptor_configs.end()) {
+          edgefirst::camera_adaptor::CameraAdaptor adaptor(config_it->second);
+
+          if (adaptor.RequiresConversion()) {
+            // Get DMA-BUF fd if available
+            int dmabuf_fd = -1;
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+            if (dmabuf_manager_ && dmabuf_enabled_) {
+              TfLiteBufferHandle dmabuf_handle = dmabuf_manager_->FindByTensorIndex(tensor_idx);
+              if (dmabuf_handle != kTfLiteNullBufferHandle) {
+                dmabuf_fd = dmabuf_manager_->GetFd(dmabuf_handle);
+                TFLITE_LOG(TFLITE_LOG_INFO,
+                           "CameraAdaptor: tensor %d has DMA-BUF fd=%d", tensor_idx, dmabuf_fd);
+              }
+            }
+#endif
+            // tensors_[tensor_idx] is now TRANSIENT - CameraAdaptor will create INPUT
+            // and Slice from INPUT -> TRANSIENT
+            auto result = adaptor.InjectPreprocessing(graph_, tensors_[tensor_idx], dmabuf_fd);
+
+            if (result.success) {
+              // Check if this is a passthrough (no conversion needed)
+              // In passthrough, camera_input == model_input == original_input
+              if (result.camera_input == tensors_[tensor_idx] && 
+                  result.model_input == tensors_[tensor_idx]) {
+                // Passthrough: no actual conversion needed
+                // The TRANSIENT tensor has no producer, must recreate as INPUT
+                TFLITE_LOG(TFLITE_LOG_INFO,
+                           "CameraAdaptor: passthrough for tensor %d (no conversion needed)",
+                           tensor_idx);
+                
+                const auto tensor = &(context->tensors[tensor_idx]);
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+                if (dmabuf_fd >= 0) {
+                  tensors_[tensor_idx] = CreateTensorWithDmaBuf(
+                      graph_, tensor, tim::vx::TensorAttribute::INPUT, {}, dmabuf_fd);
+                  TFLITE_LOG(TFLITE_LOG_INFO,
+                             "CameraAdaptor passthrough: recreated tensor %d as INPUT (DMA-BUF fd=%d)",
+                             tensor_idx, dmabuf_fd);
+                } else {
+                  tensors_[tensor_idx] =
+                      CreateTensor(graph_, tensor, tim::vx::TensorAttribute::INPUT, {});
+                }
+#else
+                tensors_[tensor_idx] =
+                    CreateTensor(graph_, tensor, tim::vx::TensorAttribute::INPUT, {});
+#endif
+                // Remove from camera adaptor configs since no conversion is used
+                parent_delegate_->camera_adaptor_configs.erase(tensor_idx);
+              } else {
+                // Actual conversion: store the camera_input tensor for DMA-BUF tracking
+                // Model operations should continue to use tensors_[tensor_idx] (3-channel TRANSIENT)
+                // camera_input is stored separately for data input
+                camera_input_tensors_[tensor_idx] = result.camera_input;
+                TFLITE_LOG(TFLITE_LOG_INFO,
+                           "CameraAdaptor: injected %s->%s preprocessing for tensor %d%s",
+                           edgefirst::camera_adaptor::ColorSpaceToString(adaptor.adaptor()),
+                           edgefirst::camera_adaptor::ColorSpaceToString(adaptor.model_format()),
+                           tensor_idx,
+                           dmabuf_fd >= 0 ? " (DMA-BUF backed)" : "");
+              }
+            } else {
+              // CameraAdaptor injection failed - recover by recreating tensor as INPUT
+              // The TRANSIENT tensor has no producer, so we must replace it
+              TFLITE_LOG(TFLITE_LOG_WARNING,
+                         "CameraAdaptor: failed for tensor %d: %s - falling back to direct input",
+                         tensor_idx, result.error_message.c_str());
+
+              const auto tensor = &(context->tensors[tensor_idx]);
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+              if (dmabuf_fd >= 0) {
+                // Recreate as INPUT with DMA-BUF backing
+                tensors_[tensor_idx] = CreateTensorWithDmaBuf(
+                    graph_, tensor, tim::vx::TensorAttribute::INPUT, {}, dmabuf_fd);
+                TFLITE_LOG(TFLITE_LOG_INFO,
+                           "CameraAdaptor fallback: recreated tensor %d as INPUT (DMA-BUF fd=%d)",
+                           tensor_idx, dmabuf_fd);
+              } else {
+                // Recreate as regular INPUT
+                tensors_[tensor_idx] =
+                    CreateTensor(graph_, tensor, tim::vx::TensorAttribute::INPUT, {});
+                TFLITE_LOG(TFLITE_LOG_INFO,
+                           "CameraAdaptor fallback: recreated tensor %d as INPUT",
+                           tensor_idx);
+              }
+#else
+              // Recreate as regular INPUT
+              tensors_[tensor_idx] =
+                  CreateTensor(graph_, tensor, tim::vx::TensorAttribute::INPUT, {});
+              TFLITE_LOG(TFLITE_LOG_INFO,
+                         "CameraAdaptor fallback: recreated tensor %d as INPUT",
+                         tensor_idx);
+#endif
+              // Remove from camera adaptor configs to prevent future attempts
+              parent_delegate_->camera_adaptor_configs.erase(tensor_idx);
+            }
+          }
+        }
       }
     }
 
@@ -858,6 +988,30 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     if (dmabuf_manager_ && dmabuf_enabled_) {
       TfLiteBufferHandle dmabuf_handle = dmabuf_manager_->FindByTensorIndex(tensor_idx);
       if (dmabuf_handle != kTfLiteNullBufferHandle) {
+        // Check if CameraAdaptor is configured for this tensor
+        // When CameraAdaptor is used, the graph has:
+        //   camera_input_tensors_[idx] (INPUT w/ dmabuf) -> [Slice] -> [Sub] -> tensors_[idx] (TRANSIENT)
+        // Data flows through the pipeline automatically; no manual copy needed
+        auto camera_it = camera_input_tensors_.find(tensor_idx);
+        if (camera_it != camera_input_tensors_.end()) {
+          auto camera_input = camera_it->second;
+          auto infered_camera_input = layout_infered_.second[camera_input];
+          if (infered_camera_input && infered_camera_input->HasDmaBuf()) {
+            if (dmabuf_zerocopy_logged_.insert(tensor_idx).second) {
+              TFLITE_LOG_PROD(TFLITE_LOG_INFO,
+                         "CameraAdaptor input %d: ZERO-COPY pipeline (fd=%lld)",
+                         tensor_idx, (long long)infered_camera_input->GetDmaBufFd());
+            }
+          } else {
+            TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
+                       "CameraAdaptor input %d: DMABUF LOST after layout inference! (infered=%p, hasDmaBuf=%d)",
+                       tensor_idx, infered_camera_input.get(),
+                       infered_camera_input ? infered_camera_input->HasDmaBuf() : -1);
+          }
+          continue;
+        }
+
+        // Non-CameraAdaptor dmabuf path
         auto infered_input_tensor = layout_infered_.second[src_input_tensor];
         if (infered_input_tensor) {
           // Check if inferred tensor preserved the dmabuf (true zero-copy path)

@@ -24,6 +24,9 @@
 
 #include "vx_delegate_dmabuf.h"
 #include "delegate_main.h"
+#include "camera_adaptor/color_space.h"
+#include "camera_adaptor/config.h"
+#include "tensorflow/lite/minimal_logging.h"
 
 namespace {
 
@@ -230,6 +233,165 @@ TfLiteBufferHandle VxDelegateGetActiveBuffer(TfLiteDelegate* delegate,
     return kTfLiteNullBufferHandle;
   }
   return mgr->GetActiveBuffer(tensor_index);
+}
+
+/* ============================================================================
+ * Camera Adaptor API implementations
+ * ============================================================================
+ */
+
+TfLiteStatus VxCameraAdaptorSetFormat(TfLiteDelegate* delegate,
+                                       int input_tensor_index,
+                                       const char* adaptor) {
+  if (!delegate || !adaptor) {
+    return kTfLiteError;
+  }
+
+  auto* derived = reinterpret_cast<vx::delegate::DerivedDelegateData*>(delegate);
+
+  // Create config from format string
+  auto config = edgefirst::camera_adaptor::CreateConfigFromString(adaptor);
+  derived->camera_adaptor_configs[input_tensor_index] = config;
+
+  return kTfLiteOk;
+}
+
+TfLiteStatus VxCameraAdaptorSetFormatEx(TfLiteDelegate* delegate,
+                                         int input_tensor_index,
+                                         const char* adaptor,
+                                         uint32_t resize_width,
+                                         uint32_t resize_height,
+                                         bool letterbox,
+                                         uint32_t letterbox_color) {
+  if (!delegate || !adaptor) {
+    return kTfLiteError;
+  }
+
+  auto* derived = reinterpret_cast<vx::delegate::DerivedDelegateData*>(delegate);
+
+  // Create config from format string with resize options
+  auto config = edgefirst::camera_adaptor::CreateConfigFromString(adaptor);
+  config.resize_width = resize_width;
+  config.resize_height = resize_height;
+  config.letterbox = letterbox;
+  config.letterbox_color = letterbox_color;
+
+  derived->camera_adaptor_configs[input_tensor_index] = config;
+
+  return kTfLiteOk;
+}
+
+TfLiteStatus VxCameraAdaptorSetFormats(TfLiteDelegate* delegate,
+                                        int input_tensor_index,
+                                        const char* adaptor,
+                                        const char* model_format) {
+  if (!delegate || !adaptor || !model_format) {
+    return kTfLiteError;
+  }
+
+  auto* derived = reinterpret_cast<vx::delegate::DerivedDelegateData*>(delegate);
+
+  // Create config from format string with explicit model format
+  auto config = edgefirst::camera_adaptor::CreateConfigFromString(adaptor);
+  config.model_format = edgefirst::camera_adaptor::ColorSpaceFromString(model_format);
+
+  derived->camera_adaptor_configs[input_tensor_index] = config;
+
+  return kTfLiteOk;
+}
+
+TfLiteStatus VxCameraAdaptorSetFourCC(TfLiteDelegate* delegate,
+                                       int input_tensor_index,
+                                       uint32_t fourcc) {
+  if (!delegate) {
+    return kTfLiteError;
+  }
+
+  auto* derived = reinterpret_cast<vx::delegate::DerivedDelegateData*>(delegate);
+
+  // Create config from V4L2-style FourCC
+  auto config = edgefirst::camera_adaptor::CreateConfigFromFourCC(fourcc);
+  derived->camera_adaptor_configs[input_tensor_index] = config;
+
+  return kTfLiteOk;
+}
+
+const char* VxCameraAdaptorGetFormat(TfLiteDelegate* delegate,
+                                      int input_tensor_index) {
+  if (!delegate) {
+    return nullptr;
+  }
+
+  auto* derived = reinterpret_cast<vx::delegate::DerivedDelegateData*>(delegate);
+
+  auto it = derived->camera_adaptor_configs.find(input_tensor_index);
+  if (it == derived->camera_adaptor_configs.end()) {
+    return nullptr;
+  }
+
+  return edgefirst::camera_adaptor::ColorSpaceToString(it->second.adaptor);
+}
+
+bool VxCameraAdaptorIsSupported(const char* adaptor) {
+  if (!adaptor) {
+    return false;
+  }
+
+  // Parse the format and check if it's one of our supported conversions
+  auto cs = edgefirst::camera_adaptor::ColorSpaceFromString(adaptor);
+
+  // Currently supported: all 4-channel RGB/BGR variants that can be converted
+  // via Slice (alpha drop) + optional Reverse (channel swap)
+  switch (cs) {
+    // 3-channel passthrough formats
+    case edgefirst::camera_adaptor::ColorSpace::Rgb:
+    case edgefirst::camera_adaptor::ColorSpace::Bgr:
+    // 4-channel formats (Slice + optional Reverse)
+    case edgefirst::camera_adaptor::ColorSpace::Rgba:
+    case edgefirst::camera_adaptor::ColorSpace::Bgra:
+    case edgefirst::camera_adaptor::ColorSpace::Rgbx:
+    case edgefirst::camera_adaptor::ColorSpace::Bgrx:
+    case edgefirst::camera_adaptor::ColorSpace::Argb:
+    case edgefirst::camera_adaptor::ColorSpace::Abgr:
+    case edgefirst::camera_adaptor::ColorSpace::Xrgb:
+    case edgefirst::camera_adaptor::ColorSpace::Xbgr:
+      return true;
+    default:
+      // YUV, Bayer, etc. not yet implemented
+      return false;
+  }
+}
+
+int VxCameraAdaptorGetInputChannels(const char* adaptor) {
+  if (!adaptor) {
+    return 0;
+  }
+  auto cs = edgefirst::camera_adaptor::ColorSpaceFromString(adaptor);
+  return edgefirst::camera_adaptor::GetInputChannels(cs);
+}
+
+int VxCameraAdaptorGetOutputChannels(const char* adaptor) {
+  if (!adaptor) {
+    return 0;
+  }
+  auto cs = edgefirst::camera_adaptor::ColorSpaceFromString(adaptor);
+  return edgefirst::camera_adaptor::GetOutputChannels(cs);
+}
+
+const char* VxCameraAdaptorGetFourCC(const char* adaptor) {
+  if (!adaptor) {
+    return nullptr;
+  }
+  auto cs = edgefirst::camera_adaptor::ColorSpaceFromString(adaptor);
+  return edgefirst::camera_adaptor::GetFourCC(cs);
+}
+
+const char* VxCameraAdaptorFromFourCC(const char* fourcc) {
+  if (!fourcc) {
+    return nullptr;
+  }
+  auto cs = edgefirst::camera_adaptor::FromFourCC(fourcc);
+  return edgefirst::camera_adaptor::ColorSpaceToString(cs);
 }
 
 }  // extern "C"

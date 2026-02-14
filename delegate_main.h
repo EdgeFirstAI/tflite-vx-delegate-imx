@@ -36,6 +36,7 @@
 #include "absl/types/optional.h"
 #include "vsi_npu_custom_op.h"
 #include "dmabuf_manager.h"
+#include "camera_adaptor/config.h"
 #include "tensorflow/lite/builtin_op_data.h"
 #include "tensorflow/lite/builtin_ops.h"
 #include "tensorflow/lite/context.h"
@@ -108,6 +109,8 @@ struct DerivedDelegateData {
     std::shared_ptr<DmaBufManager> dmabuf_manager;
     // Flag for graph invalidation (set by VxDelegateInvalidateGraph)
     bool needs_invalidation;
+    // Camera adaptor configuration per input tensor index
+    std::map<int, edgefirst::camera_adaptor::CameraAdaptorConfig> camera_adaptor_configs;
 };
 
 TfLiteDelegate* VxDelegate(const VxDelegateOptions* options);
@@ -212,6 +215,11 @@ class Delegate {
 
   // Log zero-copy status once per tensor (avoid per-frame spam)
   std::set<int> dmabuf_zerocopy_logged_;
+
+  // CameraAdaptor: stores the actual INPUT tensors for camera data
+  // When CameraAdaptor is used, tensors_ contains TRANSIENT tensors for model ops,
+  // while camera_input_tensors_ contains the INPUT tensors for DMA-BUF data
+  std::map<int, std::shared_ptr<tim::vx::Tensor>> camera_input_tensors_;
 };
 
 }  // namespace delegate
