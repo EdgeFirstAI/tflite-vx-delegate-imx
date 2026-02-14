@@ -25,6 +25,7 @@
 #include "delegate_main.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -33,6 +34,7 @@
 
 #include "op_map.h"
 #include "utils.h"
+#include "vx_delegate_dmabuf.h"
 #include "tensorflow/lite/minimal_logging.h"
 #include "tensorflow/lite/context_util.h"
 #include "tensorflow/lite/kernels/internal/reference/reference_ops.h"
@@ -56,8 +58,16 @@ TfLiteRegistration DelegateNodeRegistration() {
 
   r.init = [](TfLiteContext* context, const char* buffer, size_t) -> void* {
     auto* params = reinterpret_cast<const TfLiteDelegateParams*>(buffer);
+    auto* derivedDelegate = reinterpret_cast<vx::delegate::DerivedDelegateData*>(params->delegate);
+
     std::unique_ptr<vx::delegate::Delegate> delegate(
         new vx::delegate::Delegate);
+
+    // Pass the shared DmaBufManager and parent delegate reference
+    if (derivedDelegate->dmabuf_manager) {
+      delegate->SetDmaBufManager(derivedDelegate->dmabuf_manager);
+    }
+    delegate->SetParentDelegate(derivedDelegate);
 
     std::unique_ptr<vx::delegate::OpData> op_data =
         delegate->Init(context, params);
@@ -315,6 +325,23 @@ std::shared_ptr<tim::vx::Tensor> CreateTensor(
   return graph->CreateTensor(spec, reinterpret_cast<const void*>(tensor_data));
 }
 
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+/**
+ * Create a TIM-VX tensor backed by a DMA-BUF for zero-copy I/O.
+ */
+std::shared_ptr<tim::vx::Tensor> CreateTensorWithDmaBuf(
+    std::shared_ptr<tim::vx::Graph>& graph,
+    const TfLiteTensor* tensor,
+    const tim::vx::TensorAttribute& attr,
+    const std::vector<uint32_t>& perm,
+    int dmabuf_fd) {
+  tim::vx::TensorSpec spec = CreateTensorSpec(tensor, perm, attr);
+  tim::vx::DmaBufferDesc dma_desc;
+  dma_desc.fd = static_cast<int64_t>(dmabuf_fd);
+  return graph->CreateTensor(spec, dma_desc);
+}
+#endif
+
 std::vector<std::shared_ptr<tim::vx::Tensor>> MapIndexesToTensors(
     const std::map<int32_t, std::shared_ptr<tim::vx::Tensor>>& tensors,
     const std::vector<int>& indexes) {
@@ -331,10 +358,24 @@ std::vector<std::shared_ptr<tim::vx::Tensor>> MapIndexesToTensors(
 
 }  // namespace
 
+// Current DerivedDelegateData — used by VxDelegateGetInstance() so that
+// callers who only have the TfLiteExternalDelegate wrapper (not the inner
+// DerivedDelegateData*) can still reach the DMA-BUF API.
+static std::atomic<vx::delegate::DerivedDelegateData*> g_current_vx_delegate{nullptr};
+
+extern "C" {
+TfLiteDelegate* VxDelegateGetInstance(void) {
+  return reinterpret_cast<TfLiteDelegate*>(
+      g_current_vx_delegate.load(std::memory_order_acquire));
+}
+}  // extern "C"
+
 namespace vx {
 namespace delegate {
 VxDelegateOptions VxDelegateOptionsDefault() {
   VxDelegateOptions options = {0};
+  options.enable_dmabuf = true;  // Enable by default
+  options.dma_heap_path = nullptr;  // Auto-detect
   return options;
 }
 
@@ -349,6 +390,8 @@ TfLiteDelegate* VxDelegateCreate(const VxDelegateOptions* options) {
 void VxDelegateDelete(TfLiteDelegate* delegate) {
   if (delegate == nullptr) return;
   auto derivedDelegate = reinterpret_cast<DerivedDelegateData*>(delegate);
+  g_current_vx_delegate.compare_exchange_strong(
+      derivedDelegate, nullptr, std::memory_order_release);
   delete derivedDelegate;
   delegate = nullptr;
 }
@@ -378,7 +421,10 @@ bool Delegate::SupportedOp(TfLiteContext* context,
 
 TfLiteDelegate* Delegate::Create(const VxDelegateOptions* options) {
   DerivedDelegateData* delegate = new DerivedDelegateData();
-  std::memset(delegate, 0, sizeof(DerivedDelegateData));
+  // Initialize only the POD TfLiteDelegate parent struct
+  // DO NOT memset the entire DerivedDelegateData - it contains C++ objects
+  // (std::string, std::shared_ptr, std::map) that have non-trivial constructors
+  std::memset(&delegate->parent, 0, sizeof(TfLiteDelegate));
 
   delegate->parent.flags = kTfLiteDelegateFlagsAllowDynamicTensors | kTfLiteDelegateFlagsRequirePropagatedShapes;
   delegate->parent.Prepare = &PrepareDelegate;
@@ -387,9 +433,31 @@ TfLiteDelegate* Delegate::Create(const VxDelegateOptions* options) {
 
   delegate->device_id = options->device_id;
   delegate->allow_cache_mode = options->allowed_cache_mode;
+  delegate->needs_invalidation = false;
   if(delegate->allow_cache_mode){
     delegate->cache_path = options->cache_file_path;
   }
+  
+  // DMA-BUF support
+  delegate->enable_dmabuf = options->enable_dmabuf;
+  if (options->dma_heap_path) {
+    delegate->dma_heap_path = options->dma_heap_path;
+  }
+  
+  // Initialize the shared DmaBufManager
+  if (delegate->enable_dmabuf) {
+    delegate->dmabuf_manager = std::make_shared<DmaBufManager>();
+    const char* heap_path = delegate->dma_heap_path.empty() ? 
+                            nullptr : delegate->dma_heap_path.c_str();
+    if (delegate->dmabuf_manager->Initialize(heap_path)) {
+      TFLITE_LOG(TFLITE_LOG_INFO, "DMA-BUF support initialized");
+    } else {
+      TFLITE_LOG(TFLITE_LOG_WARNING, "DMA-BUF initialization failed, falling back to copy mode");
+      delegate->enable_dmabuf = false;
+    }
+  }
+  
+  g_current_vx_delegate.store(delegate, std::memory_order_release);
   return reinterpret_cast<TfLiteDelegate*>(delegate);
 }
 
@@ -532,13 +600,21 @@ TfLiteStatus Delegate::Prepare(const OpData& op_data,
 TfLiteStatus Delegate::Invoke(const OpData& op_data,
                               TfLiteContext* context,
                               TfLiteNode* node) {
-  TFLITE_LOG(TFLITE_LOG_INFO, "Delegate::Invoke node: %p", node->user_data);
+  TFLITE_LOG(TFLITE_LOG_INFO, "Delegate::Invoke node: %p, compiled_=%d, dmabuf_enabled_=%d",
+             node->user_data, compiled_, dmabuf_enabled_);
+
+  // Check for graph invalidation request (e.g., after caps renegotiation)
+  if (CheckAndClearInvalidation()) {
+    TFLITE_LOG(TFLITE_LOG_INFO, "Graph invalidated, will recompile");
+  }
 
 #ifdef NODE_TRACE_DB_MODE
   std::vector<vx::delegate::TfliteNodeIDPair> tflite_node_id_map;
 #endif
 
   if (!compiled_) {
+    TFLITE_LOG(TFLITE_LOG_INFO, "Compiling graph, dmabuf_manager_=%p, dmabuf_enabled_=%d",
+               dmabuf_manager_.get(), dmabuf_enabled_);
     // TODO(bo): Handling multi-thread use case
     context_ = tim::vx::Context::Create();
     graph_ = context_->CreateGraph();
@@ -547,6 +623,26 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     for (int tensor_idx : op_data.subgraph_inputs) {
       if (-1 != tensor_idx && tensors_[tensor_idx].get() == nullptr) {
         const auto tensor = &(context->tensors[tensor_idx]);
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+        // Check if this input tensor has a registered DMA-BUF
+        TFLITE_LOG(TFLITE_LOG_INFO, "Checking input tensor %d: dmabuf_manager_=%p, dmabuf_enabled_=%d",
+                   tensor_idx, dmabuf_manager_.get(), dmabuf_enabled_);
+        if (dmabuf_manager_ && dmabuf_enabled_) {
+          TfLiteBufferHandle dmabuf_handle = dmabuf_manager_->FindByTensorIndex(tensor_idx);
+          TFLITE_LOG(TFLITE_LOG_INFO, "Input tensor %d: dmabuf_handle=%d", tensor_idx, dmabuf_handle);
+          if (dmabuf_handle != kTfLiteNullBufferHandle) {
+            int fd = dmabuf_manager_->GetFd(dmabuf_handle);
+            TFLITE_LOG(TFLITE_LOG_INFO, "Input tensor %d: fd=%d", tensor_idx, fd);
+            if (fd >= 0) {
+              tensors_[tensor_idx] = CreateTensorWithDmaBuf(
+                  graph_, tensor, tim::vx::TensorAttribute::INPUT, {}, fd);
+              TFLITE_LOG_PROD(TFLITE_LOG_INFO, 
+                         "Created dmabuf-backed input tensor %d (fd=%d)", tensor_idx, fd);
+              continue;
+            }
+          }
+        }
+#endif
         tensors_[tensor_idx] =
             CreateTensor(graph_, tensor, tim::vx::TensorAttribute::INPUT, {});
       }
@@ -556,6 +652,25 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     for (int tensor_idx : op_data.subgraph_outputs) {
       if (-1 != tensor_idx && tensors_[tensor_idx].get() == nullptr) {
         const auto tensor = &(context->tensors[tensor_idx]);
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+        // Check if this output tensor has a registered DMA-BUF
+        TFLITE_LOG(TFLITE_LOG_INFO, "Checking output tensor %d", tensor_idx);
+        if (dmabuf_manager_ && dmabuf_enabled_) {
+          TfLiteBufferHandle dmabuf_handle = dmabuf_manager_->FindByTensorIndex(tensor_idx);
+          TFLITE_LOG(TFLITE_LOG_INFO, "Output tensor %d: dmabuf_handle=%d", tensor_idx, dmabuf_handle);
+          if (dmabuf_handle != kTfLiteNullBufferHandle) {
+            int fd = dmabuf_manager_->GetFd(dmabuf_handle);
+            TFLITE_LOG(TFLITE_LOG_INFO, "Output tensor %d: fd=%d", tensor_idx, fd);
+            if (fd >= 0) {
+              tensors_[tensor_idx] = CreateTensorWithDmaBuf(
+                  graph_, tensor, tim::vx::TensorAttribute::OUTPUT, {}, fd);
+              TFLITE_LOG_PROD(TFLITE_LOG_INFO,
+                         "Created dmabuf-backed output tensor %d (fd=%d)", tensor_idx, fd);
+              continue;
+            }
+          }
+        }
+#endif
         tensors_[tensor_idx] =
             CreateTensor(graph_, tensor, tim::vx::TensorAttribute::OUTPUT, {});
       }
@@ -675,6 +790,30 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     tim::transform::MeanStdDevNormalization(graph_);
     // Do layout inference and get a new graph(first) and a tensor map(second).
     layout_infered_ = tim::transform::LayoutInference(graph_, context_);
+
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+    // Update dmabuf tensor references after layout inference and SWAP TO DMABUF
+    TFLITE_LOG(TFLITE_LOG_INFO, "Post layout inference dmabuf swap: dmabuf_manager_=%p, dmabuf_enabled_=%d",
+                    dmabuf_manager_.get(), dmabuf_enabled_);
+    if (dmabuf_manager_ && dmabuf_enabled_) {
+      // For dmabuf-backed inputs, DO NOT swap - we need to copy from dmabuf to inferred tensor on each invoke
+      // SwapHandle would swap the dmabuf handle to the inferred tensor, but then we couldn't access
+      // the dmabuf memory via the original tensor anymore.
+      // True zero-copy would require TIM-VX layout inference to preserve dmabuf handles.
+      for (int tensor_idx : op_data.subgraph_inputs) {
+        TfLiteBufferHandle handle = dmabuf_manager_->FindByTensorIndex(tensor_idx);
+        TFLITE_LOG(TFLITE_LOG_INFO, "Input tensor %d: handle=%d (no swap, will copy)", tensor_idx, handle);
+        // No SwapHandle - we'll copy from dmabuf to inferred tensor on each invoke
+      }
+      for (int tensor_idx : op_data.subgraph_outputs) {
+        TfLiteBufferHandle handle = dmabuf_manager_->FindByTensorIndex(tensor_idx);
+        TFLITE_LOG(TFLITE_LOG_INFO, "Output tensor %d: handle=%d (no swap, will copy)", tensor_idx, handle);
+        // No SwapHandle - output swap fails because inferred tensor wasn't created from handle
+        // We'll copy from inferred tensor to dmabuf after each invoke
+      }
+    }
+#endif
+
 #ifdef MULTI_DEVICE_FEATURE_MODE
       executor_ = std::make_shared<tim::vx::platform::NativeExecutor>(devices_[device_id_]);
       executable_ = tim::vx::platform::Compile(layout_infered_.first, executor_);
@@ -708,13 +847,46 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
   // TODO(derekjchow): Return error if compilation failed.
   for (int tensor_idx : op_data.subgraph_inputs) {
     const TfLiteTensor& tf_tensor = context->tensors[tensor_idx];
-    TFLITE_LOG(TFLITE_LOG_INFO, "Copying input %d: %s", tensor_idx, tf_tensor.name);
     auto src_input_tensor = tensors_[tensor_idx];
     if (!src_input_tensor.get()) {
       TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "Failed to copy input tensor!");
       return kTfLiteDelegateError;
     }
 
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+    // Check if this input is dmabuf-backed
+    if (dmabuf_manager_ && dmabuf_enabled_) {
+      TfLiteBufferHandle dmabuf_handle = dmabuf_manager_->FindByTensorIndex(tensor_idx);
+      if (dmabuf_handle != kTfLiteNullBufferHandle) {
+        auto infered_input_tensor = layout_infered_.second[src_input_tensor];
+        if (infered_input_tensor) {
+          // Check if inferred tensor preserved the dmabuf (true zero-copy path)
+          if (infered_input_tensor->HasDmaBuf()) {
+            // True zero-copy: NPU reads directly from dmabuf, no copy needed
+            if (dmabuf_zerocopy_logged_.insert(tensor_idx).second) {
+              TFLITE_LOG_PROD(TFLITE_LOG_INFO, "Dmabuf input %d: ZERO-COPY (fd=%lld)",
+                         tensor_idx, (long long)infered_input_tensor->GetDmaBufFd());
+            }
+          } else {
+            // Fallback: inferred tensor doesn't have dmabuf, need to copy
+            TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
+                       "Dmabuf input %d: HIDDEN COPY - layout inference lost dmabuf!",
+                       tensor_idx);
+            void* dmabuf_data = src_input_tensor->map(true /* invalidate cache */);
+            if (dmabuf_data) {
+              infered_input_tensor->CopyDataToTensor(dmabuf_data);
+              src_input_tensor->unmap();
+            } else {
+              TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "Failed to map dmabuf for input %d", tensor_idx);
+            }
+          }
+        }
+        continue;
+      }
+    }
+#endif
+
+    TFLITE_LOG(TFLITE_LOG_INFO, "Copying input %d: %s", tensor_idx, tf_tensor.name);
     const void* tensor_data =
         reinterpret_cast<const void*>(tf_tensor.data.raw_const);
     // TODO(derekjchow): Check result
@@ -748,6 +920,36 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
   }
 #endif
 
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+  // Buffer cycling: swap to active buffers if changed since last invoke
+  if (dmabuf_manager_ && dmabuf_enabled_ && compiled_) {
+    for (auto& [tensor_idx, swap_tensor] : dmabuf_swap_tensors_) {
+      int current_fd = dmabuf_manager_->GetActiveFd(tensor_idx);
+      int last_fd = dmabuf_active_fds_[tensor_idx];
+
+      if (current_fd != last_fd && current_fd >= 0 && swap_tensor) {
+        void* old_ptr = nullptr;
+        // Cast fd to pointer (TIM-VX convention for DMABUF tensors)
+        bool success = swap_tensor->SwapHandle(
+            reinterpret_cast<void*>(static_cast<intptr_t>(current_fd)),
+            false,  // not malloc'd by ovxlib
+            &old_ptr);
+
+        if (success) {
+          dmabuf_active_fds_[tensor_idx] = current_fd;
+          TFLITE_LOG(TFLITE_LOG_INFO,
+                     "Buffer cycling: swapped tensor %d from fd=%d to fd=%d",
+                     tensor_idx, last_fd, current_fd);
+        } else {
+          TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                          "Buffer cycling: SwapHandle failed for tensor %d",
+                          tensor_idx);
+        }
+      }
+    }
+  }
+#endif
+
   TFLITE_LOG(TFLITE_LOG_INFO, "Invoking graph");
 #ifdef MULTI_DEVICE_FEATURE_MODE
     auto executable_set = tim::vx::platform::CreateExecutableSet({executable_, executable_});
@@ -763,6 +965,39 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
 
   for (int tensor_idx : op_data.subgraph_outputs) {
     TfLiteTensor& tf_tensor = context->tensors[tensor_idx];
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+    // Check if this output is dmabuf-backed
+    if (dmabuf_manager_ && dmabuf_enabled_) {
+      TfLiteBufferHandle dmabuf_handle = dmabuf_manager_->FindByTensorIndex(tensor_idx);
+      if (dmabuf_handle != kTfLiteNullBufferHandle) {
+        auto src_output_tensor = tensors_[tensor_idx];
+        auto infered_output_tensor = layout_infered_.second[src_output_tensor];
+        if (infered_output_tensor) {
+          // Check if inferred tensor preserved the dmabuf (true zero-copy path)
+          if (infered_output_tensor->HasDmaBuf()) {
+            // True zero-copy: NPU wrote directly to dmabuf, no copy needed
+            // NOTE: Cache synchronization is the CLIENT's responsibility via
+            // DMA_BUF_IOCTL_SYNC when mmap'ing the buffer. The delegate does NOT
+            // perform cache operations in the zero-copy path to support true
+            // hardware-to-hardware pipelines (camera->NPU->display).
+            TFLITE_LOG(TFLITE_LOG_INFO, "Dmabuf output %d: zero-copy (fd=%lld)",
+                       tensor_idx, (long long)infered_output_tensor->GetDmaBufFd());
+          } else {
+            // Fallback: inferred tensor doesn't have dmabuf, need to copy
+            void* dmabuf_data = src_output_tensor->map(false /* don't invalidate, we're writing */);
+            if (dmabuf_data) {
+              infered_output_tensor->CopyDataFromTensor(dmabuf_data);
+              src_output_tensor->unmap();
+              TFLITE_LOG(TFLITE_LOG_INFO, "Dmabuf output %d: fallback copy from inferred tensor to dmabuf", tensor_idx);
+            } else {
+              TFLITE_LOG_PROD(TFLITE_LOG_ERROR, "Failed to map dmabuf for output %d", tensor_idx);
+            }
+          }
+        }
+        continue;
+      }
+    }
+#endif
     TFLITE_LOG(
         TFLITE_LOG_INFO, "Copying output %d, %s", tensor_idx, tf_tensor.name);
 #ifdef MULTI_DEVICE_FEATURE_MODE
@@ -804,7 +1039,83 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
   return kTfLiteOk;
 }
 
-Delegate::Delegate() {}
+Delegate::Delegate() : dmabuf_enabled_(false), compiled_(false), parent_delegate_(nullptr) {}
+
+void Delegate::SetDmaBufManager(std::shared_ptr<DmaBufManager> mgr) {
+  dmabuf_manager_ = mgr;
+  dmabuf_enabled_ = (mgr && mgr->IsSupported());
+}
+
+TfLiteStatus Delegate::SwapDmaBufTensor(int tensor_index, int new_fd) {
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+  if (!dmabuf_enabled_ || !compiled_) {
+    return kTfLiteError;
+  }
+
+  auto it = dmabuf_swap_tensors_.find(tensor_index);
+  if (it == dmabuf_swap_tensors_.end() || !it->second) {
+    TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                    "SwapDmaBufTensor: tensor %d not found in swap map",
+                    tensor_index);
+    return kTfLiteError;
+  }
+
+  void* old_ptr = nullptr;
+  bool success = it->second->SwapHandle(
+      reinterpret_cast<void*>(static_cast<intptr_t>(new_fd)),
+      false,
+      &old_ptr);
+
+  if (success) {
+    dmabuf_active_fds_[tensor_index] = new_fd;
+    TFLITE_LOG(TFLITE_LOG_INFO,
+               "SwapDmaBufTensor: tensor %d swapped to fd=%d",
+               tensor_index, new_fd);
+    return kTfLiteOk;
+  }
+
+  TFLITE_LOG_PROD(TFLITE_LOG_ERROR,
+                  "SwapDmaBufTensor: SwapHandle failed for tensor %d",
+                  tensor_index);
+  return kTfLiteError;
+#else
+  (void)tensor_index;
+  (void)new_fd;
+  return kTfLiteError;
+#endif
+}
+
+TfLiteStatus Delegate::InvalidateGraph() {
+  TFLITE_LOG(TFLITE_LOG_INFO, "InvalidateGraph: clearing compiled state");
+
+  compiled_ = false;
+
+  // Clear graph and context
+  layout_infered_.first.reset();
+  layout_infered_.second.clear();
+  graph_.reset();
+  context_.reset();
+
+  // Clear tensor maps
+  tensors_.clear();
+  state_tensors_.clear();
+  ops_.clear();
+
+  // Clear buffer cycling state
+  dmabuf_swap_tensors_.clear();
+  dmabuf_active_fds_.clear();
+
+  return kTfLiteOk;
+}
+
+bool Delegate::CheckAndClearInvalidation() {
+  if (parent_delegate_ && parent_delegate_->needs_invalidation) {
+    parent_delegate_->needs_invalidation = false;
+    InvalidateGraph();
+    return true;
+  }
+  return false;
+}
 
 }  // namespace delegate
 }  // namespace vx
