@@ -74,6 +74,10 @@ list(APPEND VX_DELEGATES_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/vx_delegate_adaptor.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/dmabuf_manager.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/vx_delegate_dmabuf.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/camera_adaptor/color_space.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/camera_adaptor/config.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/camera_adaptor/camera_adaptor.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/camera_adaptor/converters/alpha_drop_converter.cc
 )
 
 if(TFLITE_ENABLE_MULTI_DEVICE)
@@ -116,3 +120,4 @@ if(TFLITE_ENABLE_MULTI_DEVICE)
   add_subdirectory(examples/multi_device)
 endif()
 add_subdirectory(examples/dmabuf_benchmark)
+add_subdirectory(examples/camera_adaptor_test)
