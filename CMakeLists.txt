@@ -27,13 +27,13 @@ option(BUILD_FOR_LITERT			"Configure delegate build for LiteRT"	OFF)
 
 if(${BUILD_FOR_LITERT})
   set(TFLITE_GIT_REPOSITORY "https://github.com/nxp-imx/litert-imx")
-  set(TFLITE_GIT_TAG "lf-6.12.20_2.0.0")
+  set(TFLITE_GIT_TAG "lf-6.12.49_2.2.0")
   set(TFLITE_SUB_PATH "tflite")
   set(VX_DELEGATE_TARGET "litert_vx_delegate")
 else()
   set(TFLITE_GIT_REPOSITORY "https://github.com/nxp-imx/tensorflow-imx")
   set(TFLITE_SUB_PATH "tensorflow/lite")
-  set(TFLITE_GIT_TAG "lf-6.12.20_2.0.0")
+  set(TFLITE_GIT_TAG "lf-6.12.49_2.2.0")
   set(VX_DELEGATE_TARGET "vx_delegate")
 endif()
 
@@ -72,6 +72,8 @@ list(APPEND VX_DELEGATES_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/op_map.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/utils.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/vx_delegate_adaptor.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/dmabuf_manager.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/vx_delegate_dmabuf.cc
 )
 
 if(TFLITE_ENABLE_MULTI_DEVICE)
@@ -81,6 +83,9 @@ endif()
 if(TFLITE_ENABLE_NODE_TRACE)
   ADD_DEFINITIONS(-DNODE_TRACE_DB_MODE)
 endif()
+
+# Enable DMA-BUF physical tensor support (required for zero-copy)
+ADD_DEFINITIONS(-DVX_CREATE_TENSOR_SUPPORT_PHYSICAL)
 
 add_library(${VX_DELEGATE_TARGET} SHARED ${VX_DELEGATES_SRCS})
 include_directories(
@@ -110,3 +115,4 @@ add_subdirectory(examples/minimal)
 if(TFLITE_ENABLE_MULTI_DEVICE)
   add_subdirectory(examples/multi_device)
 endif()
+add_subdirectory(examples/dmabuf_benchmark)
