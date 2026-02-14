@@ -298,6 +298,137 @@ bool VxDelegateIsGraphCompiled(TfLiteDelegate* delegate);
 TfLiteBufferHandle VxDelegateGetActiveBuffer(TfLiteDelegate* delegate,
                                               int tensor_index);
 
+/* ============================================================================
+ * Camera Adaptor APIs
+ * ============================================================================
+ *
+ * These APIs configure runtime preprocessing to convert camera formats to
+ * model-expected formats (e.g., RGBA -> RGB). The conversion operations are
+ * injected into the TIM-VX graph and run on the NPU.
+ *
+ * This is the runtime counterpart to the EdgeFirst Python CameraAdaptor library.
+ */
+
+/**
+ * Configure camera adaptor for an input tensor.
+ *
+ * Call this before the first Invoke() to inject preprocessing operations.
+ * The format can be a lowercase name (e.g., "rgba", "yuyv") or a FourCC
+ * code (e.g., "RGBA", "YUYV", "NV12").
+ *
+ * @param delegate The VX delegate instance
+ * @param input_tensor_index TFLite input tensor index
+ * @param adaptor Format string (e.g., "rgba", "yuyv", "nv12")
+ * @return kTfLiteOk on success
+ */
+TfLiteStatus VxCameraAdaptorSetFormat(TfLiteDelegate* delegate,
+                                       int input_tensor_index,
+                                       const char* adaptor);
+
+/**
+ * Configure camera adaptor with resize options.
+ *
+ * Extended version that also configures optional resize/letterbox.
+ *
+ * @param delegate The VX delegate instance
+ * @param input_tensor_index TFLite input tensor index
+ * @param adaptor Format string
+ * @param resize_width Target width (0 = no resize)
+ * @param resize_height Target height (0 = no resize)
+ * @param letterbox If true, preserve aspect ratio with padding
+ * @param letterbox_color RGB packed padding color (e.g., 0x808080 for grey)
+ * @return kTfLiteOk on success
+ */
+TfLiteStatus VxCameraAdaptorSetFormatEx(TfLiteDelegate* delegate,
+                                         int input_tensor_index,
+                                         const char* adaptor,
+                                         uint32_t resize_width,
+                                         uint32_t resize_height,
+                                         bool letterbox,
+                                         uint32_t letterbox_color);
+
+/**
+ * Configure camera adaptor with explicit model format.
+ *
+ * Use this when the model expects a different format than RGB (e.g., BGR).
+ * Supported combinations:
+ * - RGBA → RGB, RGBA → BGR
+ * - BGRA → RGB, BGRA → BGR
+ * - Similar for RGBX, BGRX, ARGB, ABGR, XRGB, XBGR
+ *
+ * @param delegate The VX delegate instance
+ * @param input_tensor_index TFLite input tensor index
+ * @param adaptor Camera format string (e.g., "rgba", "bgra")
+ * @param model_format Model's expected format (e.g., "rgb", "bgr")
+ * @return kTfLiteOk on success
+ */
+TfLiteStatus VxCameraAdaptorSetFormats(TfLiteDelegate* delegate,
+                                        int input_tensor_index,
+                                        const char* adaptor,
+                                        const char* model_format);
+
+/**
+ * Configure camera adaptor using V4L2-style FourCC code.
+ *
+ * @param delegate The VX delegate instance
+ * @param input_tensor_index TFLite input tensor index
+ * @param fourcc V4L2 FourCC code (e.g., V4L2_PIX_FMT_RGBA32)
+ * @return kTfLiteOk on success
+ */
+TfLiteStatus VxCameraAdaptorSetFourCC(TfLiteDelegate* delegate,
+                                       int input_tensor_index,
+                                       uint32_t fourcc);
+
+/**
+ * Query current adaptor format for a tensor.
+ *
+ * @param delegate The VX delegate instance
+ * @param input_tensor_index TFLite input tensor index
+ * @return Format string, or NULL if not configured
+ */
+const char* VxCameraAdaptorGetFormat(TfLiteDelegate* delegate,
+                                      int input_tensor_index);
+
+/**
+ * Check if an adaptor format is supported.
+ *
+ * @param adaptor Format string to check
+ * @return true if supported
+ */
+bool VxCameraAdaptorIsSupported(const char* adaptor);
+
+/**
+ * Get the number of input channels for a format.
+ *
+ * @param adaptor Format string
+ * @return Input channel count (e.g., 4 for RGBA)
+ */
+int VxCameraAdaptorGetInputChannels(const char* adaptor);
+
+/**
+ * Get the number of output channels for a format.
+ *
+ * @param adaptor Format string
+ * @return Output channel count (e.g., 3 for RGBA->RGB)
+ */
+int VxCameraAdaptorGetOutputChannels(const char* adaptor);
+
+/**
+ * Get the FourCC code for an adaptor format.
+ *
+ * @param adaptor Format string
+ * @return FourCC string, or NULL if unknown
+ */
+const char* VxCameraAdaptorGetFourCC(const char* adaptor);
+
+/**
+ * Convert a FourCC code to adaptor format string.
+ *
+ * @param fourcc FourCC string
+ * @return Format string
+ */
+const char* VxCameraAdaptorFromFourCC(const char* fourcc);
+
 #ifdef __cplusplus
 }
 #endif
