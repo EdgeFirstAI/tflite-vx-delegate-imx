@@ -251,6 +251,7 @@ std::unique_ptr<tflite::Interpreter> make_interpreter(
 
   if (interp->ModifyGraphWithDelegate(delegate) != kTfLiteOk ||
       interp->AllocateTensors() != kTfLiteOk) {
+    interp.reset();  // destroy interpreter before delegate
     vx::delegate::VxDelegateDelete(delegate);
     delegate = nullptr;
     return nullptr;
@@ -394,8 +395,10 @@ int main(int argc, char* argv[]) {
 
   if (!dmabuf_ok) {
     std::cout << "\nDMA-BUF not available - cannot test zero-copy path\n";
-    vx::delegate::VxDelegateDelete(copy_del);
+    zc_interp.reset();
+    copy_interp.reset();
     vx::delegate::VxDelegateDelete(zc_del);
+    vx::delegate::VxDelegateDelete(copy_del);
     return 1;
   }
   std::cout << "DMA heap: " << heap.device() << "\n\n";
@@ -580,8 +583,14 @@ int main(int argc, char* argv[]) {
   // Cleanup
   // -------------------------------------------------------------------------
 
-  vx::delegate::VxDelegateDelete(copy_del);
+  // Interpreters must be destroyed BEFORE delegates because interpreter
+  // cleanup accesses delegate data through the parent_delegate_ pointer.
+  zc_interp.reset();
+  copy_interp.reset();
+  in_bufs.clear();
+  out_bufs.clear();
   vx::delegate::VxDelegateDelete(zc_del);
+  vx::delegate::VxDelegateDelete(copy_del);
 
   return outputs_match ? 0 : 1;
 }
