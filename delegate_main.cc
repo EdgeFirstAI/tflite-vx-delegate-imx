@@ -999,14 +999,16 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
           if (infered_camera_input && infered_camera_input->HasDmaBuf()) {
             if (dmabuf_zerocopy_logged_.insert(tensor_idx).second) {
               TFLITE_LOG_PROD(TFLITE_LOG_INFO,
-                         "CameraAdaptor input %d: ZERO-COPY pipeline (fd=%lld)",
+                         "CameraAdaptor input %d: zero-copy pipeline (fd=%lld)",
                          tensor_idx, (long long)infered_camera_input->GetDmaBufFd());
             }
           } else {
-            TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
-                       "CameraAdaptor input %d: DMABUF LOST after layout inference! (infered=%p, hasDmaBuf=%d)",
-                       tensor_idx, infered_camera_input.get(),
-                       infered_camera_input ? infered_camera_input->HasDmaBuf() : -1);
+            if (dmabuf_zerocopy_logged_.insert(tensor_idx).second) {
+              TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
+                         "CameraAdaptor input %d: DMABUF LOST after layout inference! (infered=%p, hasDmaBuf=%d)",
+                         tensor_idx, infered_camera_input.get(),
+                         infered_camera_input ? infered_camera_input->HasDmaBuf() : -1);
+            }
           }
           continue;
         }
@@ -1018,14 +1020,16 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
           if (infered_input_tensor->HasDmaBuf()) {
             // True zero-copy: NPU reads directly from dmabuf, no copy needed
             if (dmabuf_zerocopy_logged_.insert(tensor_idx).second) {
-              TFLITE_LOG_PROD(TFLITE_LOG_INFO, "Dmabuf input %d: ZERO-COPY (fd=%lld)",
+              TFLITE_LOG_PROD(TFLITE_LOG_INFO, "Dmabuf input %d: zero-copy (fd=%lld)",
                          tensor_idx, (long long)infered_input_tensor->GetDmaBufFd());
             }
           } else {
             // Fallback: inferred tensor doesn't have dmabuf, need to copy
-            TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
-                       "Dmabuf input %d: HIDDEN COPY - layout inference lost dmabuf!",
-                       tensor_idx);
+            if (dmabuf_zerocopy_logged_.insert(tensor_idx).second) {
+              TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
+                         "Dmabuf input %d: HIDDEN COPY - layout inference lost dmabuf!",
+                         tensor_idx);
+            }
             void* dmabuf_data = src_input_tensor->map(true /* invalidate cache */);
             if (dmabuf_data) {
               infered_input_tensor->CopyDataToTensor(dmabuf_data);
@@ -1258,6 +1262,9 @@ TfLiteStatus Delegate::InvalidateGraph() {
   // Clear buffer cycling state
   dmabuf_swap_tensors_.clear();
   dmabuf_active_fds_.clear();
+
+  // Clear log dedup so messages reappear after recompilation
+  dmabuf_zerocopy_logged_.clear();
 
   return kTfLiteOk;
 }
