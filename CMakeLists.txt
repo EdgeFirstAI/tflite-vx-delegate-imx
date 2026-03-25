@@ -74,6 +74,7 @@ list(APPEND VX_DELEGATES_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/vx_delegate_adaptor.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/dmabuf_manager.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/vx_delegate_dmabuf.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/hal_dmabuf.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/camera_adaptor/color_space.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/camera_adaptor/config.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/camera_adaptor/camera_adaptor.cc
