@@ -5,89 +5,41 @@
 | Field | Value |
 |-------|-------|
 | **Author** | Sébastien Taylor <sebastien@au-zone.com> |
-| **Version** | 1.6.0 |
-| **Date** | 2026-02-13 |
+| **Version** | 1.7.0 |
+| **Date** | 2026-03-27 |
+| **Status** | Test Release |
+
+### Changelog
+
+| Version | Date | Description |
+|---------|------|-------------|
+| 1.7.0 | 2026-03-27 | Full API reference, HAL API section, export mode documented, buffer cycling technical analysis, cross-references |
+| 1.6.0 | 2026-02-13 | DRM PRIME import, cache sync documentation, buffer cycling investigation |
 
 ---
 
 ## Overview
 
-This document describes the DMA-BUF zero-copy API for the TFLite VX Delegate. The implementation enables applications to share buffers directly with the NPU without memory copies.
+This document describes the DMA-BUF zero-copy API for the TFLite VX Delegate on NXP i.MX 8M Plus. The implementation enables applications to share DMA buffers directly with the VSI NPU, eliminating CPU memcpy from the inference data path.
 
 ### Key Features
 
-- **Zero-copy inference**: Eliminates memcpy between CPU and NPU
+- **Zero-copy input and output**: NPU reads and writes CMA DMA-BUFs directly
+- **Export mode**: Delegate allocates buffers on behalf of the caller
+- **DRM PRIME auto-attach**: `DMA_BUF_IOCTL_SYNC` is automatically effective on cached CMA heaps
+- **HAL API**: Backend-agnostic `hal_dmabuf_*` symbols for cross-delegate portability
+- **CameraAdaptor**: NPU-injected format conversion, see [CAMERAADAPTOR.md](CAMERAADAPTOR.md)
 - **Backward compatible**: Existing copy-based applications work unchanged
-- **Client-controlled sync**: Cache coherency managed by application via dmabuf API
-- **CMA memory**: Uses `/dev/dma_heap/linux,cma` for cached contiguous memory
 
 ### Why Zero-Copy?
 
-The copy-based approach requires memcpy for every inference:
-- Adds latency proportional to buffer size
-- Doubles memory footprint (CPU + NPU copies)
-- Cannot support async/pipelined video workflows
+The copy-based path requires `memcpy` on every inference:
 
-Zero-copy eliminates these copies. For hardware-to-hardware (H2H) pipelines (camera→NPU→display), no CPU involvement is needed at all.
+- Latency proportional to buffer size (1.9 MB input at ~142 MB/s ≈ 13 ms for YOLOv8n 640×640)
+- Doubles memory footprint (CPU copy + NPU copy)
+- Prevents hardware-to-hardware (H2H) pipelines where no CPU involvement is needed
 
----
-
-## Current Status
-
-### Working Features
-
-- [x] Zero-copy input path (NPU reads from dmabuf)
-- [x] Zero-copy output path (NPU writes to dmabuf)
-- [x] Dmabuf fd preservation through TIM-VX layout inference
-- [x] Backwards compatibility with non-dmabuf applications
-- [x] DRM PRIME import for cache coherent DMA_BUF_IOCTL_SYNC on cached CMA heaps
-
-### Pending Features
-
-- [ ] Buffer cycling for V4L2 buffer pools (see [Known Limitations](#known-limitations---buffer-cycling))
-- [ ] Export mode (delegate-allocated buffers)
-
----
-
-## Performance Benchmarks
-
-All benchmarks performed on NXP i.MX 8M Plus EVK with Vivante NPU.
-
-### Benchmark Methodology
-
-- **Copy-based**: `memcpy_in` → `invoke` → `memcpy_out`
-- **Zero-copy**: `invoke` → `output_sync`
-
-Output sync (`DMA_BUF_IOCTL_SYNC`) is only required when CPU reads the output. For hardware-to-hardware pipelines (camera→NPU→display/encoder), no output sync is needed.
-
-### Important: Synthetic Benchmark Limitations
-
-These are **synthetic benchmarks** designed for sanity checking the zero-copy implementation. The copy-based path appears faster than real-world scenarios because:
-
-- **Cache-hot buffers**: Same input data every iteration keeps buffers in L1/L2 cache
-- **No CPU contention**: Benchmark has exclusive CPU access with no other workloads
-- **No buffer cycling**: Real V4L2 pipelines rotate through multiple buffers, causing cache misses
-- **i.MX 8M Plus L2 cache**: 1 MB shared L2 means small inputs (≤1 MB) fit entirely in cache
-
-Real-world camera/video pipelines will show larger benefits from zero-copy due to cache pressure from video decode, preprocessing, and other concurrent CPU work.
-
-### Summary
-
-| Model | I/O Size | Copy-based | Zero-copy | Difference |
-|-------|----------|------------|-----------|------------|
-| MobileNet 224×224 | 148 KB | 3,516 µs | 3,814 µs | +298 µs (slower) |
-| YOLOv8n 640×480 | 1.8 MB | 64,286 µs | 63,971 µs | -315 µs |
-| YOLOv8n 640×640 | 1.9 MB | 68,438 µs | 67,734 µs | -704 µs |
-| YOLOv8n 1024×768 | 4.6 MB | 167,951 µs | 165,110 µs | -2,841 µs |
-| YOLOv8n 1280×1280 | 7.5 MB | 287,775 µs | 280,659 µs | -7,116 µs |
-
-**Key insights**:
-- Zero-copy benefits scale with buffer size
-- Small inputs that fit in cache see no benefit (or slight regression)
-- Large buffers benefit from both eliminated memcpy AND faster NPU invoke
-- Real camera pipelines with buffer cycling will show larger improvements
-
-**For H2H pipelines** (no CPU output access): The zero-copy times above include output_sync (5–414 µs depending on buffer size). Pure H2H pipelines skip this sync entirely, providing additional savings.
+Zero-copy eliminates these copies. For H2H pipelines (camera→NPU→display/encoder), no CPU cache operations are needed at all.
 
 ---
 
@@ -96,159 +48,304 @@ Real-world camera/video pipelines will show larger benefits from zero-copy due t
 ### Software Stack
 
 ```mermaid
-flowchart TB
-    subgraph APP[Client Application]
-        direction LR
-        CAM[Camera V4L2]
-        INF[NPU Inference]
-        DISP[Display DRM]
-        CAM --> INF --> DISP
+graph TB
+    subgraph APP["Client Application"]
+        V4L2["Camera V4L2 / DRM"]
+        INF["Inference loop"]
+        DISP["Display / Encoder"]
+        V4L2 --> INF --> DISP
     end
 
-    subgraph DEL[VX Delegate]
-        DMABUF[DmaBufManager]
+    subgraph DEL["VX Delegate (libvx_delegate.so)"]
+        MGR["DmaBufManager<br/>registration, allocation, cycling"]
+        HAL["hal_dmabuf_* exports<br/>(visibility=default)"]
+        CAM["CameraAdaptor<br/>(optional format injection)"]
     end
 
-    subgraph TIM[TIM-VX]
-        TENSOR[CreateTensor with DmaBufferDesc]
+    subgraph TIM["TIM-VX (edgefirst-dmabuf branch)"]
+        CT["CreateTensor(spec, DmaBufferDesc{fd})<br/>zero-copy NPU tensor"]
+        LI["Layout inference<br/>fd preserved through transform"]
     end
 
-    subgraph HW[i.MX 8M Plus NPU]
-        CMA[Direct CMA Access]
+    subgraph HW["i.MX 8M Plus VSI NPU"]
+        CMA["Direct CMA access<br/>via SMMU DMA mapping"]
+    end
+
+    subgraph KRN["Kernel"]
+        HEAP["/dev/dma_heap/linux,cma"]
+        DRM["/dev/dri/renderD128<br/>(DRM PRIME attachment)"]
     end
 
     APP --> DEL
     DEL --> TIM
     TIM --> HW
+    MGR --> HEAP
+    MGR --> DRM
+
+    style HAL fill:#e1f5ff
+    style MGR fill:#e8f5e9
+    style CT fill:#e8f5e9
 ```
 
-**DmaBufManager** tracks registered buffers, maps fd to TfLiteBufferHandle, and binds handles to tensor indices.
+### Buffer Ownership Models
 
-**TIM-VX** creates tensors backed by dmabuf and preserves the fd through layout inference.
-
-**NPU** accesses dmabuf memory directly via CMA with no CPU copies in the data path.
-
-### Example Pipeline
-
-The following diagram shows a typical video analytics pipeline with two output paths: H2H (GPU rendering) and CPU post-processing.
+The VX delegate supports two ownership models:
 
 ```mermaid
 flowchart LR
-    V4L2[V4L2 Camera]
-    NPU[NPU VX Delegate]
-    GPU[GPU OpenGL]
-    CPU[CPU Decoder]
+    subgraph Import["Import mode (client-owned fd)"]
+        CI["Client allocates fd<br/>(V4L2 EXPBUF, dma_heap, DRM)"]
+        RI["VxDelegateRegisterDmaBuf(fd, size)"]
+        BI["VxDelegateBindDmaBufToTensor(handle, idx)"]
+        CI --> RI --> BI
+    end
 
-    V4L2 -->|dmabuf| NPU
-    NPU -->|"dmabuf (H2H)"| GPU
-    NPU -->|"dmabuf + sync"| CPU
+    subgraph Export["Export mode (delegate-owned fd)"]
+        RE["VxDelegateRequestDmaBuf(size, &desc)"]
+        BE["VxDelegateBindDmaBufToTensor(handle, idx)"]
+        UE["delegate allocates from /dev/dma_heap/linux,cma<br/>desc.fd → mmap for CPU access"]
+        RE --> BE
+        RE --> UE
+    end
 ```
 
-**H2H Path (GPU)**: Camera writes to dmabuf, NPU reads/writes dmabuf, GPU renders from dmabuf. No CPU cache operations needed—all hardware devices access memory directly.
+### Example Video Analytics Pipeline
 
-**CPU Path**: Same as H2H but requires `DMA_BUF_IOCTL_SYNC` before CPU reads the output buffer to ensure cache coherency.
+```mermaid
+flowchart LR
+    V4L2["V4L2 Camera<br/>(dmabuf fd)"]
+    G2D["G2D Resize<br/>+ Letterbox"]
+    NPU["VX Delegate<br/>+ CameraAdaptor"]
+    GPU["GPU OpenGL<br/>(H2H path)"]
+    CPU["CPU Decoder<br/>(+ DMA_BUF_IOCTL_SYNC)"]
+
+    V4L2 -->|dmabuf| G2D
+    G2D -->|dmabuf| NPU
+    NPU -->|dmabuf — no sync| GPU
+    NPU -->|dmabuf + sync_for_cpu| CPU
+```
+
+---
+
+## Performance Benchmarks
+
+All benchmarks performed on NXP i.MX 8M Plus FRDM with Vivante VIP8000 NPU.
+
+### Benchmark Methodology
+
+| Mode | Sequence |
+|------|----------|
+| Copy-based | `memcpy_in` → `Invoke()` → `memcpy_out` |
+| Zero-copy | `Invoke()` → `sync_for_cpu` (output only) |
+
+Output sync is only required when CPU reads the output. H2H pipelines (no CPU output access) skip `sync_for_cpu` entirely and save the times shown below.
+
+### Important: Synthetic Benchmark Limitations
+
+These are **synthetic benchmarks** for sanity-checking the zero-copy implementation. Copy-based times appear faster than real-world because:
+
+- **Cache-hot buffers**: Same input every iteration stays in L1/L2 cache
+- **No CPU contention**: No concurrent video decode or preprocessing
+- **No buffer cycling**: Real V4L2 pipelines cycle through 3–4 buffers, causing cache misses
+- **1 MB L2**: Small inputs (≤1 MB) fit entirely in cache; memcpy reads from cache, not DRAM
+
+Real camera pipelines with concurrent CPU workloads will show larger zero-copy benefits.
+
+### Results
+
+| Model | I/O Size | Copy-based | Zero-copy | Difference |
+|-------|----------|------------|-----------|------------|
+| MobileNet 224×224 | 148 KB | 3,516 µs | 3,814 µs | +298 µs (cache-hot) |
+| YOLOv8n 640×480 | 1.8 MB | 64,286 µs | 63,971 µs | −315 µs |
+| YOLOv8n 640×640 | 1.9 MB | 68,438 µs | 67,734 µs | −704 µs |
+| YOLOv8n 1024×768 | 4.6 MB | 167,951 µs | 165,110 µs | −2,841 µs |
+| YOLOv8n 1280×1280 | 7.5 MB | 287,775 µs | 280,659 µs | −7,116 µs |
+
+Zero-copy benefits scale with buffer size. Large buffers benefit from both eliminated `memcpy` and reduced NPU invoke time (direct CMA access vs. copy-destination memory).
 
 ---
 
 ## API Reference
 
-All APIs are declared in `vx_delegate_dmabuf.h`.
-
-### Delegate Options
+All APIs are declared in `vx_delegate_dmabuf.h`. The delegate must be created with `enable_dmabuf = true`.
 
 ```cpp
 VxDelegateOptions options = VxDelegateOptionsDefault();
-options.enable_dmabuf = true;  // Enable dmabuf API
+options.enable_dmabuf = true;
 TfLiteDelegate* delegate = VxDelegateCreate(&options);
 ```
 
-### Buffer Registration
+> **`TfLiteExternalDelegateCreate()` users**: This wrapper hides the inner `DerivedDelegateData*` pointer. Always call `VxDelegateGetInstance(delegate)` to get the inner pointer before calling any `VxDelegate*` or `hal_dmabuf_*` functions.
 
-| Function | Description |
-|----------|-------------|
-| `VxDelegateRegisterDmaBuf()` | Register client-provided dmabuf fd |
-| `VxDelegateUnregisterDmaBuf()` | Unregister a buffer |
-| `VxDelegateBindDmaBufToTensor()` | Bind buffer to tensor index |
-| `VxDelegateIsDmaBufSupported()` | Check platform support |
+### Singleton Access
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `VxDelegateGetInstance` | `(TfLiteDelegate*) → TfLiteDelegate*` | Unwraps the external delegate wrapper. Required when using `TfLiteExternalDelegateCreate`. |
+
+### Support Check
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `VxDelegateIsDmaBufSupported` | `(TfLiteDelegate*) → bool` | Returns true if `/dev/dma_heap` was opened successfully. |
+
+### Import Mode (Client-Owned Buffers)
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `VxDelegateRegisterDmaBuf` | `(delegate, fd, size, sync_mode) → TfLiteBufferHandle` | Register a client-provided dmabuf fd. Automatically creates DRM PRIME attachment. |
+| `VxDelegateUnregisterDmaBuf` | `(delegate, handle) → TfLiteStatus` | Unregister. Does **not** close the fd (client retains ownership). |
+| `VxDelegateGetDmaBufFd` | `(delegate, handle) → int` | Retrieve the fd associated with a handle. |
+
+### Export Mode (Delegate-Allocated Buffers)
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `VxDelegateRequestDmaBuf` | `(delegate, size, align, ownership, desc*) → TfLiteBufferHandle` | Allocate from `/dev/dma_heap/linux,cma` with 64-byte NPU alignment. Fills `desc.fd` and `desc.size`. Caller must provide `desc.size` (from `tensor->bytes` after `AllocateTensors()`). |
+| `VxDelegateReleaseDmaBuf` | `(delegate, handle) → TfLiteStatus` | Release delegate-allocated buffer. Closes the fd. |
+
+### Tensor Binding
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `VxDelegateBindDmaBufToTensor` | `(delegate, handle, tensor_index) → TfLiteStatus` | Bind a registered/allocated buffer to a TFLite tensor index. |
 
 ### Cache Synchronization
 
-| Function | Description |
-|----------|-------------|
-| `VxDelegateSyncForDevice()` | Flush CPU caches before NPU access |
-| `VxDelegateSyncForCpu()` | Invalidate caches before CPU read |
+| Function | Semantic | ioctl flags |
+|----------|----------|-------------|
+| `VxDelegateSyncForDevice` | Flush CPU caches before NPU reads | `DMA_BUF_SYNC_END \| WRITE` |
+| `VxDelegateSyncForCpu` | Invalidate CPU caches before CPU reads | `DMA_BUF_SYNC_START \| READ` |
+| `VxDelegateBeginCpuAccess` | Begin CPU access with explicit sync mode | `DMA_BUF_SYNC_START \| mode` |
+| `VxDelegateEndCpuAccess` | End CPU access with explicit sync mode | `DMA_BUF_SYNC_END \| mode` |
+
+`VxDelegateSyncForDevice` = `EndCpuAccess(Write)`. `VxDelegateSyncForCpu` = `BeginCpuAccess(Read)`.
+
+`VxDmaBufSyncMode`: `kVxDmaBufSyncNone`, `kVxDmaBufSyncRead`, `kVxDmaBufSyncWrite`, `kVxDmaBufSyncReadWrite`.
+
+### Buffer Cycling
+
+Buffer cycling allows switching between a pool of input buffers (e.g., V4L2 ring) without rebinding tensors. See [Buffer Cycling Limitation](#buffer-cycling-limitation) for the current technical constraint.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `VxDelegateSetActiveDmaBuf` | `(delegate, tensor_index, handle) → TfLiteStatus` | Set the active buffer for a tensor before `Invoke()`. |
+| `VxDelegateGetActiveBuffer` | `(delegate, tensor_index) → TfLiteBufferHandle` | Get the currently active handle. Falls back to first bound handle. |
+| `VxDelegateInvalidateGraph` | `(delegate) → TfLiteStatus` | Mark graph as needing recompilation on next `Invoke()`. |
+| `VxDelegateIsGraphCompiled` | `(delegate) → bool` | Returns `false` if invalidation is pending. |
+
+---
+
+## HAL API
+
+`hal_dmabuf.h` is a self-contained C header that exposes the same capability via an opaque `hal_delegate_t` handle. It is used by language bindings, NNStreamer, and cross-delegate consumers (Neutron and VX delegates export the same symbols).
+
+See [EdgeFirst HAL ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md) for the full ABI specification.
+
+### Types
+
+```c
+typedef void *hal_delegate_t;
+
+typedef struct hal_dmabuf_tensor_info {
+    size_t size;
+    size_t offset;                   /* always 0 for VX delegate (one fd per tensor) */
+    size_t shape[HAL_DMABUF_MAX_NDIM];
+    size_t ndim;                     /* 0 until after first Invoke() */
+    int    fd;                       /* borrowed — do NOT close */
+    hal_dtype dtype;                 /* HAL_DTYPE_U8 until after first Invoke() */
+} hal_dmabuf_tensor_info;
+
+typedef struct hal_camera_adaptor_format_info {
+    int  input_channels;
+    int  output_channels;
+    char fourcc[8];
+} hal_camera_adaptor_format_info;
+```
+
+### Functions
+
+| Function | Returns | Notes |
+|----------|---------|-------|
+| `hal_dmabuf_get_instance()` | `hal_delegate_t` | Inner delegate handle (unwraps external wrapper). |
+| `hal_dmabuf_is_supported(delegate)` | `int` 1/0 | Does not set errno. |
+| `hal_dmabuf_get_tensor_info(delegate, idx, info*, info_size)` | `int` 0/−1 | `shape`/`dtype` valid only after first `Invoke()`. |
+| `hal_dmabuf_sync_for_device(delegate, idx)` | `int` 0/−1 | Flush before NPU reads. |
+| `hal_dmabuf_sync_for_cpu(delegate, idx)` | `int` 0/−1 | Invalidate after NPU writes. |
+| `hal_camera_adaptor_is_supported(delegate, format)` | `int` 1/0 | `delegate` unused. |
+| `hal_camera_adaptor_get_format_info(delegate, format, info*, info_size)` | `int` 0/−1 | Fills channels and FourCC. |
+
+**errno values**: `EINVAL` (bad args), `ENOTSUP` (dmabuf not enabled), `ERANGE` (tensor index not found), `EIO` (ioctl failure).
 
 ---
 
 ## Cache Synchronization
 
-### DRM PRIME Import (Automatic)
+### DRM PRIME Attachment (Automatic)
 
-On cached CMA heaps (`/dev/dma_heap/linux,cma`), the kernel's `begin_cpu_access`
-implementation iterates over the buffer's attachment list to perform cache
-maintenance via `dma_sync_sgtable_for_cpu()`. **If no device has attached to
-the DMA-buf, `DMA_BUF_IOCTL_SYNC` is a complete no-op** — no cache invalidation
-or flush occurs, and CPU reads after NPU writes will see stale data.
+On cached CMA heaps (`/dev/dma_heap/linux,cma`), the kernel's `dma_buf_begin_cpu_access()` iterates the buffer's attachment list to invoke `dma_sync_sgtable_for_cpu()`. **Without an active attachment, `DMA_BUF_IOCTL_SYNC` is a complete no-op** — no cache invalidation or flush occurs, and CPU reads after NPU writes will see stale data.
 
-The `DmaBufManager` automatically creates a persistent DRM PRIME import
-(`DRM_IOCTL_PRIME_FD_TO_HANDLE` via `/dev/dri/renderD128`) for every registered
-or allocated buffer. This creates a `dma_buf_attach` in the kernel that makes
-`DMA_BUF_IOCTL_SYNC` effective. The GEM handle is held for the buffer's lifetime
-and released on unregister/release.
+`DmaBufManager` automatically creates a DRM PRIME attachment (`DRM_IOCTL_PRIME_FD_TO_HANDLE` on `/dev/dri/renderD128`) for every registered or allocated buffer. This GEM handle is held for the buffer's lifetime and released on unregister/release. The attachment makes `DMA_BUF_IOCTL_SYNC` effective.
 
-**Clients do not need to perform this step** — the delegate handles it
-transparently. If `/dev/dri/renderD128` is not available, a warning is logged
-and sync ioctls may be no-ops on cached heaps. Using the uncached heap
-(`/dev/dma_heap/linux,cma-uncached`) avoids this requirement entirely since
-GPU writes are immediately visible to CPU reads without cache maintenance.
+```mermaid
+flowchart TD
+    Reg["VxDelegateRegisterDmaBuf(fd, size)"]
+    DRM["DRM_IOCTL_PRIME_FD_TO_HANDLE<br/>/dev/dri/renderD128"]
+    Attach["dma_buf_attach() created in kernel"]
+    Sync["DMA_BUF_IOCTL_SYNC<br/>→ dma_sync_sgtable_for_cpu()<br/>→ cache ops on CMA pages"]
+    NoSync["DMA_BUF_IOCTL_SYNC<br/>→ no-op (no attachments)"]
 
-### Client Responsibility
+    Reg --> DRM --> Attach --> Sync
+    Reg -->|without DRM| NoSync
 
-**The delegate does NOT perform cache synchronization in the zero-copy path.** This is intentional to support true hardware-to-hardware pipelines where no CPU cache operations are needed.
-
-The VX Delegate provides `VxDelegateSyncForDevice()` and `VxDelegateSyncForCpu()` helper functions for convenience, but client applications can also use the Linux DMA-BUF API directly. See the [Linux DMA-BUF documentation](https://docs.kernel.org/driver-api/dma-buf.html) for complete details.
-
-### Memory Type
-
-DMA-BUF buffers are allocated from `/dev/dma_heap/linux,cma` which provides **cached** contiguous memory. This means:
-- CPU access is fast (cached)
-- Sync ioctls are required when switching between CPU and device access
-- No sync needed for pure H2H pipelines
-
-### DMA-CPU-DMA Chain (Invalidate-Modify-Flush)
-
-When the CPU modifies a buffer in a DMA→CPU→DMA workflow, the proper cache synchronization pattern is:
-
-1. **Invalidate** before CPU read: Ensures CPU sees latest data written by DMA device
-2. **Modify**: CPU reads/writes the buffer
-3. **Flush** after CPU write: Ensures DMA device sees CPU's modifications
-
-```c
-#include <linux/dma-buf.h>
-#include <sys/ioctl.h>
-
-// 1. INVALIDATE: Before CPU reads/writes (get latest DMA data)
-struct dma_buf_sync sync = {
-    .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW
-};
-ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync);
-
-// 2. MODIFY: CPU accesses buffer
-memcpy(mapped_ptr, input_data, size);  // or read from mapped_ptr
-
-// 3. FLUSH: After CPU is done (sync back to DMA memory)
-sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
-ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync);
-
-// Now safe to call Invoke() - NPU will see CPU's writes
+    style Sync fill:#90ee90
+    style NoSync fill:#ffcccb
 ```
 
-### Hardware-to-Hardware Pipelines
+Clients do not need to perform this step. If `/dev/dri/renderD128` is unavailable, a warning is logged and sync ioctls may be no-ops on cached heaps. The uncached heap (`/dev/dma_heap/linux,cma-uncached`) avoids this requirement entirely.
 
-For camera→NPU→display where CPU never touches the data:
+### Client Sync Responsibility
 
-```cpp
-// No sync needed - hardware devices manage coherency
+The delegate does **not** perform automatic cache synchronization in the zero-copy path. This is intentional: H2H pipelines (camera→NPU→display) require no cache operations at all.
+
+```mermaid
+flowchart LR
+    subgraph CPUWrite["CPU writes input"]
+        W1["memcpy / CPU fill"]
+        W2["VxDelegateSyncForDevice()<br/>= DMA_BUF_SYNC_END | WRITE"]
+        W3["Invoke()"]
+        W1 --> W2 --> W3
+    end
+
+    subgraph H2H["H2H path (GPU/camera writes input)"]
+        H1["GPU glFinish() or G2D done"]
+        H2["Invoke() — no CPU sync needed"]
+        H1 --> H2
+    end
+
+    subgraph CPURead["CPU reads output"]
+        R1["Invoke()"]
+        R2["VxDelegateSyncForCpu()<br/>= DMA_BUF_SYNC_START | READ"]
+        R3["CPU reads output"]
+        R1 --> R2 --> R3
+    end
+```
+
+### DMA→CPU→DMA Chain (Invalidate–Modify–Flush)
+
+When CPU modifies a buffer between two device accesses:
+
+```c
+// 1. Invalidate before CPU reads device-written data
+VxDelegateBeginCpuAccess(delegate, handle, kVxDmaBufSyncReadWrite);
+
+// 2. CPU modifies buffer
+memcpy(mapped_ptr, new_input, size);
+
+// 3. Flush so device sees CPU writes
+VxDelegateEndCpuAccess(delegate, handle, kVxDmaBufSyncReadWrite);
+
+// Safe to call Invoke() — NPU sees CPU's modifications
 interpreter->Invoke();
 ```
 
@@ -256,92 +353,121 @@ interpreter->Invoke();
 
 ## Usage Examples
 
-### Complete Zero-Copy Example
-
-This example shows the complete flow from model loading through zero-copy inference. The API is standard TFLite with the VX Delegate plus dmabuf registration.
+### Import Mode: Client-Provided Buffer
 
 ```cpp
-#include "tensorflow/lite/interpreter.h"
-#include "tensorflow/lite/kernels/register.h"
-#include "tensorflow/lite/model.h"
 #include "vx_delegate.h"
 #include "vx_delegate_dmabuf.h"
-#include <sys/mman.h>
 
-// 1. Load model (standard TFLite)
-auto model = tflite::FlatBufferModel::BuildFromFile("model.tflite");
-tflite::ops::builtin::BuiltinOpResolver resolver;
-std::unique_ptr<tflite::Interpreter> interpreter;
-tflite::InterpreterBuilder(*model, resolver)(&interpreter);
+// 1. Create delegate and interpreter
+VxDelegateOptions opts = VxDelegateOptionsDefault();
+opts.enable_dmabuf = true;
+TfLiteDelegate* delegate = VxDelegateCreate(&opts);
 
-// 2. Create VX Delegate with dmabuf enabled
-VxDelegateOptions options = VxDelegateOptionsDefault();
-options.enable_dmabuf = true;
-TfLiteDelegate* delegate = VxDelegateCreate(&options);
-
-// 3. Apply delegate and allocate tensors
 interpreter->ModifyGraphWithDelegate(delegate);
 interpreter->AllocateTensors();
 
-// 4. Get tensor info
-int input_idx = interpreter->inputs()[0];
+int input_idx  = interpreter->inputs()[0];
 int output_idx = interpreter->outputs()[0];
-size_t input_size = interpreter->input_tensor(0)->bytes;
-size_t output_size = interpreter->output_tensor(0)->bytes;
 
-// 5. Allocate dmabufs (or receive from V4L2/DRM)
-int input_fd = /* from dma_heap_alloc() or V4L2 VIDIOC_EXPBUF */;
-int output_fd = /* from dma_heap_alloc() or DRM */;
+// 2. Provide your own fds (from V4L2, dma_heap, DRM, etc.)
+int input_fd  = /* from VIDIOC_EXPBUF or DMA_HEAP_IOCTL_ALLOC */;
+int output_fd = /* from DRM or dma_heap */;
 
-// 6. Register and bind dmabufs to tensors
-auto in_handle = VxDelegateRegisterDmaBuf(delegate, input_fd, input_size, kVxDmaBufSyncNone);
-VxDelegateBindDmaBufToTensor(delegate, in_handle, input_idx);
+// 3. Register and bind
+TfLiteBufferHandle in_h  = VxDelegateRegisterDmaBuf(delegate, input_fd,  input_size,  kVxDmaBufSyncNone);
+TfLiteBufferHandle out_h = VxDelegateRegisterDmaBuf(delegate, output_fd, output_size, kVxDmaBufSyncNone);
+VxDelegateBindDmaBufToTensor(delegate, in_h,  input_idx);
+VxDelegateBindDmaBufToTensor(delegate, out_h, output_idx);
 
-auto out_handle = VxDelegateRegisterDmaBuf(delegate, output_fd, output_size, kVxDmaBufSyncNone);
-VxDelegateBindDmaBufToTensor(delegate, out_handle, output_idx);
-
-// 7. Map for CPU access (once, before inference loop)
-void* in_ptr = mmap(NULL, input_size, PROT_READ|PROT_WRITE, MAP_SHARED, input_fd, 0);
+// 4. Map for CPU fallback access
+void* in_ptr  = mmap(NULL, input_size,  PROT_READ|PROT_WRITE, MAP_SHARED, input_fd,  0);
 void* out_ptr = mmap(NULL, output_size, PROT_READ|PROT_WRITE, MAP_SHARED, output_fd, 0);
 
-// 8. Inference loop
+// 5. Inference loop
 while (running) {
-    // Fill input (with sync if CPU writes)
-    // ...
+    memcpy(in_ptr, new_frame_data, input_size);
+    VxDelegateSyncForDevice(delegate, in_h);   // flush CPU writes
 
     interpreter->Invoke();
 
-    // Read output (with sync if CPU reads)
-    // ...
+    VxDelegateSyncForCpu(delegate, out_h);     // invalidate before CPU read
+    process_output(out_ptr, output_size);
 }
 
-// 9. Cleanup
-munmap(in_ptr, input_size);
-munmap(out_ptr, output_size);
-VxDelegateUnregisterDmaBuf(delegate, in_handle);
-VxDelegateUnregisterDmaBuf(delegate, out_handle);
+// 6. Cleanup
+VxDelegateUnregisterDmaBuf(delegate, in_h);
+VxDelegateUnregisterDmaBuf(delegate, out_h);
 VxDelegateDelete(delegate);
 ```
 
-### V4L2 Camera Integration
+### Export Mode: Delegate-Allocated Buffer
+
+```cpp
+// After AllocateTensors() — query tensor size first
+size_t input_size = interpreter->input_tensor(0)->bytes;
+
+VxDmaBufDesc desc = {};
+desc.size = input_size;
+TfLiteBufferHandle in_h = VxDelegateRequestDmaBuf(
+    delegate, input_size, 64 /*align*/, kVxDmaBufOwnerDelegate, &desc);
+VxDelegateBindDmaBufToTensor(delegate, in_h, input_idx);
+
+// desc.fd is now a delegate-owned dmabuf — mmap for CPU access
+void* in_ptr = mmap(NULL, input_size, PROT_READ|PROT_WRITE, MAP_SHARED, desc.fd, 0);
+
+// Inference loop same as import mode ...
+
+VxDelegateReleaseDmaBuf(delegate, in_h);   // closes desc.fd
+```
+
+### V4L2 Camera Integration (H2H)
 
 ```cpp
 // Camera provides dmabuf fd via VIDIOC_EXPBUF
 int camera_fd = /* from V4L2 DMABUF export */;
+TfLiteBufferHandle h = VxDelegateRegisterDmaBuf(delegate, camera_fd, size, kVxDmaBufSyncNone);
+VxDelegateBindDmaBufToTensor(delegate, h, input_idx);
 
-// Register camera buffer
-auto handle = VxDelegateRegisterDmaBuf(delegate, camera_fd, size, kVxDmaBufSyncNone);
-VxDelegateBindDmaBufToTensor(delegate, handle, input_tensor_idx);
-
-// Camera fills buffer directly, no CPU sync needed
+// H2H inference — no CPU sync needed, hardware manages coherency
 interpreter->Invoke();
 ```
 
-### Buffer Cycling (V4L2 Buffer Pool) - NOT CURRENTLY SUPPORTED
+---
 
-Buffer cycling for V4L2 buffer pools is **not currently viable** due to hardware/driver limitations. See [Known Limitations](#known-limitations---buffer-cycling) for technical details.
+## Buffer Cycling Limitation
 
-**Current workaround**: Use a single DMABUF for the input tensor and memcpy from V4L2 buffers. This loses the zero-copy benefit but avoids the recompilation overhead that would otherwise be required for each buffer switch.
+Buffer cycling allows switching the active input buffer (e.g., from a V4L2 ring of 3–4 buffers) between `Invoke()` calls via `VxDelegateSetActiveDmaBuf()` without rebinding tensors.
+
+### Current Constraint
+
+The `VxDelegateSetActiveDmaBuf()` API is implemented and the handle tracking works correctly. However, **cycling does not take effect on the VSI NPU** because physical DMA addresses are baked into the compiled NBG binary during `CompileToBinary()`:
+
+```mermaid
+flowchart TD
+    Compile["CompileToBinary() — NBG generated<br/>Physical DMA address of buffer fd → NPU command stream"]
+    Swap["VxDelegateSetActiveDmaBuf(new_handle)"]
+    Invoke["Invoke()"]
+    NPU["NPU reads from address in NBG binary<br/>(original buffer, not new handle)"]
+
+    Compile --> Swap --> Invoke --> NPU
+
+    style NPU fill:#ffcccb
+```
+
+Three approaches were investigated, all with the same root cause:
+
+| Approach | API | Result | Why |
+|----------|-----|--------|-----|
+| Pool tensor swap | `vxSwapTensor()` | Success reported, NPU reads old buffer | Pool tensors not connected to graph ops |
+| SwapHandleWithCache | `vxSwapTensorHandleWithCache()` | Same failure | Cache mechanism only works for NBG nodes already in cache list |
+| Direct fd swap | `vxSwapTensorHandle(fd, new_fd)` | Old ptr returned, NPU ignores | Updates host-side structs only; physical address in NBG is immutable |
+
+### Workaround
+
+For multi-buffer V4L2 pipelines, use a single registered input buffer and `memcpy` from V4L2 buffers into it. This loses the zero-copy benefit for the input stage but avoids the ~20 ms graph recompilation that a full re-bind would require.
+
+A driver-level fix would require the Vivante firmware to support indirect addressing (pointer table patchable at runtime) or a DMABUF-aware swap API that re-maps physical addresses in the compiled NBG without full recompilation.
 
 ---
 
@@ -351,19 +477,18 @@ Buffer cycling for V4L2 buffer pools is **not currently viable** due to hardware
 
 - NXP i.MX 8M Plus target or compatible
 - Yocto SDK (e.g., `yocto-sdk-imx8mp-frdm-6.12.49-2.2.0`)
-- TIM-VX `edgefirst-dmabuf` branch
+- TIM-VX [`edgefirst-dmabuf` branch](https://github.com/EdgeFirstAI/tim-vx-imx)
 
 ### Build TIM-VX
 
 ```bash
 source /opt/yocto-sdk-imx8mp-frdm-6.12.49-2.2.0/environment-setup-armv8a-poky-linux
 
-# CRITICAL: Add dmabuf support define
+# Required: expose DmaBufferDesc in TIM-VX tensor API
 export CXXFLAGS="${CXXFLAGS} -DVX_CREATE_TENSOR_SUPPORT_PHYSICAL"
 export CMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS} -DVX_CREATE_TENSOR_SUPPORT_PHYSICAL"
 
-cd tim-vx-imx
-rm -rf build && mkdir build && cd build
+cd tim-vx-imx && rm -rf build && mkdir build && cd build
 
 cmake .. \
   -DCONFIG=YOCTO \
@@ -382,8 +507,7 @@ source /opt/yocto-sdk-imx8mp-frdm-6.12.49-2.2.0/environment-setup-armv8a-poky-li
 export CXXFLAGS="${CXXFLAGS} -DVX_CREATE_TENSOR_SUPPORT_PHYSICAL"
 export CMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS} -DVX_CREATE_TENSOR_SUPPORT_PHYSICAL"
 
-cd tflite-vx-delegate-imx
-rm -rf build && mkdir build && cd build
+cd tflite-vx-delegate-imx && rm -rf build && mkdir build && cd build
 
 cmake .. \
   -DTIM_VX_INSTALL=~/Software/NXP/tim-vx-imx/build/install \
@@ -404,18 +528,22 @@ scp tflite-vx-delegate-imx/build/libvx_delegate.so root@TARGET:/usr/lib/
 
 ## TIM-VX Modifications
 
-The `edgefirst-dmabuf` branch includes these changes:
+Repository: [`github.com/EdgeFirstAI/tim-vx-imx`](https://github.com/EdgeFirstAI/tim-vx-imx) — `edgefirst-dmabuf` branch
+
+Three changes are required in TIM-VX to support DMA-BUF tensors:
 
 ### 1. Tensor API Extensions (`include/tim/vx/tensor.h`)
+
+New virtual methods expose the DMA-BUF fd from a compiled tensor:
 
 ```cpp
 virtual bool HasDmaBuf() const { return false; }
 virtual int64_t GetDmaBufFd() const { return -1; }
 ```
 
-### 2. Layout Inference (`src/tim/transform/layout_inference.cc`)
+### 2. Layout Inference fd Preservation (`src/tim/transform/layout_inference.cc`)
 
-Preserves dmabuf fd when creating inferred tensors for I/O:
+Without this patch, layout inference creates new tensors that lose the original DMA-BUF fd association. The patch checks the source tensor and recreates inferred I/O tensors with the same `DmaBufferDesc`:
 
 ```cpp
 if (src_tensor->HasDmaBuf()) {
@@ -425,9 +553,9 @@ if (src_tensor->HasDmaBuf()) {
 }
 ```
 
-### 3. Alignment Check (`src/tim/vx/internal/src/vsi_nn_tensor.c`)
+### 3. Alignment Check Bypass (`src/tim/vx/internal/src/vsi_nn_tensor.c`)
 
-Skips pointer alignment validation for dmabuf (fd is not a pointer):
+The existing alignment validation expects a virtual pointer. DMA-BUF tensors pass an fd (integer), not a pointer, so the check must be skipped:
 
 ```c
 if (tensor->attr.vsi_memory_type != VSI_MEMORY_TYPE_DMABUF) {
@@ -439,97 +567,57 @@ if (tensor->attr.vsi_memory_type != VSI_MEMORY_TYPE_DMABUF) {
 
 ## Implementation Files
 
-| File | Description |
-|------|-------------|
-| `vx_delegate_dmabuf.h` | Public C API |
-| `vx_delegate_dmabuf.cc` | API implementation |
-| `dmabuf_manager.h` | Buffer tracking, DrmAttachment class |
-| `dmabuf_manager.cc` | DmaBufManager + DrmAttachment implementation |
-| `delegate_main.h` | Delegate options, DmaBufManager integration |
-| `delegate_main.cc` | Zero-copy path in Invoke() |
+| File | Role |
+|------|------|
+| `vx_delegate_dmabuf.h` | Public C API — `VxDelegate*` and `VxCameraAdaptor*` functions |
+| `vx_delegate_dmabuf.cc` | API implementation — routes to `DmaBufManager` and `camera_adaptor` |
+| `dmabuf_manager.h` | `DmaBufManager` class + `DrmAttachment` RAII class + `DmaBufEntry` struct |
+| `dmabuf_manager.cc` | Buffer registration, CMA allocation, DRM PRIME attach, TIM-VX tensor creation, cache sync |
+| `hal_dmabuf.h` | Self-contained HAL C header — `hal_delegate_t`, `hal_dmabuf_*`, `hal_camera_adaptor_*` |
+| `hal_dmabuf.cc` | HAL implementation — wraps `VxDelegate*`, exports with `visibility("default")` |
+| `delegate_main.h` | `DerivedDelegateData` definition, `DmaBufManager` ownership, `VxDelegateOptions` |
+| `delegate_main.cc` | Zero-copy path in `Invoke()`, `ModifyGraphWithDelegate()` hook for CameraAdaptor |
+| `camera_adaptor/` | CameraAdaptor subsystem — see [CAMERAADAPTOR.md](CAMERAADAPTOR.md) |
+| `examples/dmabuf_benchmark/` | Benchmark comparing copy vs zero-copy paths with output identity validation |
 
 ---
 
 ## Troubleshooting
 
-### Symbol Not Found: vxTensorSelectLayer
+### `DMA_BUF_IOCTL_SYNC` Has No Effect
 
-TIM-VX was built from wrong branch. Ensure you're using the branch matching your SDK version.
+Most common cause: no DRM PRIME attachment. Verify `/dev/dri/renderD128` exists and is accessible. If the device is unavailable, a warning is logged during `RegisterBuffer()`. Use `/dev/dma_heap/linux,cma-uncached` to bypass cache maintenance entirely.
 
-### VX_CREATE_TENSOR_SUPPORT_PHYSICAL Not Defined
+### Symbol Not Found: `vxTensorSelectLayer`
 
-The SDK's CMAKE_CXX_FLAGS overwrites cmake -D flags. Export the flags before cmake:
+TIM-VX was built from the wrong branch. Ensure you are using [`edgefirst-dmabuf`](https://github.com/EdgeFirstAI/tim-vx-imx).
+
+### `VX_CREATE_TENSOR_SUPPORT_PHYSICAL` Not Defined
+
+The SDK's `CMAKE_CXX_FLAGS` overwrites `-D` flags passed to cmake. Export the define before cmake invocation:
 
 ```bash
 export CMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS} -DVX_CREATE_TENSOR_SUPPORT_PHYSICAL"
 ```
 
-### Zero-copy Slower Than Expected
+### Zero-Copy Slower Than Copy-Based
 
-For models with small tensor I/O (<1 MB total), the copy-based path may be faster due to dmabuf setup overhead when buffers fit entirely in CPU cache. The delegate is fully backwards compatible—simply don't register dmabufs for these tensors and the standard copy path will be used automatically.
-
----
-
-## Known Limitations - Buffer Cycling
-
-### Problem Statement
-
-V4L2 camera pipelines typically use a ring of 3-4 buffers. For true zero-copy, the delegate would need to switch between these buffers without recompilation overhead. The goal was O(1) buffer switching (~microseconds), but the only working approach requires full graph recompilation (~20ms for MobileNet), which is not viable for real-time pipelines.
-
-### Approaches Investigated
-
-#### 1. Pool Tensor + vxSwapTensor (tensor-to-tensor swap)
-
-Created pool tensors for each non-active buffer after layout inference, then called `vsi_nn_SwapTensorHandle(tensor0, tensor1)` which internally uses `vxSwapTensor()`.
-
-**Result**: SwapHandle reported success, but NPU continued reading from the original buffer.
-
-**Root cause**: Pool tensors weren't connected to any graph operations. The warning "Graph has free input, INPUT tensor may be created but not consumed" confirmed this. The swap mechanism expects both tensors to be bound to operations in the graph.
-
-#### 2. SwapHandleWithCache
-
-Enabled the swap_handle_cache feature via `vsi_nn_SwapTensorHandleWithCache()`, which should rebind tensors via `vxSetParameterByIndex` before graph execution.
-
-**Result**: Same failure - swap reports success but NPU reads from wrong buffer.
-
-**Root cause**: The `_check_swapped_tensors()` function in TIM-VX only processes NBG nodes, and the cache requires tensors to already be in the cache_list (populated only for NBG nodes with swapped tensors).
-
-#### 3. Direct FD Swap (vxSwapTensorHandle with raw pointer)
-
-Bypassed pool tensors entirely and called `vxSwapTensorHandle(tensor, new_fd, &old_ptr)` directly on the active tensor.
-
-**Result**: Function returned success and `old_ptr` was correctly returned, but NPU still read from original physical address.
-
-**Root cause**: For DMABUF tensors, the fd is mapped to a physical address during `CompileToBinary()`. The physical addresses are baked into the NPU command stream (NBG binary). `vxSwapTensorHandle` updates host-side data structures but does not update the addresses in the compiled NBG.
-
-### Fundamental Limitation
-
-When `CompileToBinary()` generates the NPU binary (NBG), **physical DMA addresses are embedded directly into the command stream**. The TIM-VX/OpenVX swap APIs are designed for:
-- Regular handle-based tensors (user-space virtual pointers)
-- Tensors that are both connected to the same graph operations
-
-They do **not** work for:
-- DMABUF tensors where the "handle" is a kernel fd mapped to physical memory
-- Swapping to a tensor that isn't already bound to graph operations
-- Updating physical addresses in an already-compiled NBG
-
-### What Would Be Needed
-
-For true O(1) buffer cycling with DMABUF, the Vivante driver would need:
-
-1. **DMABUF-aware swap API** that re-maps physical addresses in the compiled NBG without full recompilation, OR
-2. **Indirect addressing mode** where the NBG references a pointer table that can be updated at runtime
-
-Neither capability appears to be available in the current TIM-VX/VXC/OpenVX driver stack on i.MX 8M Plus.
-
-### Current Status
-
-Buffer cycling feature is **parked** pending driver-level support. The zero-copy implementation works correctly for single-buffer scenarios (static DMABUF binding).
+For models with small tensors (≤1 MB total I/O), the copy-based path may be faster because cache-hot buffers already reside in L2. The delegate is fully backward-compatible — do not register dmabufs for those tensors and the standard copy path is used automatically.
 
 ---
+
+## Cross-Repository Dependencies
+
+| Repository | Role |
+|-----------|------|
+| [`EdgeFirstAI/tim-vx-imx`](https://github.com/EdgeFirstAI/tim-vx-imx) (`edgefirst-dmabuf` branch) | TIM-VX with `DmaBufferDesc`, fd preservation, alignment bypass |
+| [`EdgeFirstAI/tflite-rs`](https://github.com/EdgeFirstAI/tflite-rs) | Rust + Python bindings (`DmaBuf<'a>`, `PyDmaBuf`) |
+| [`EdgeFirstAI/nnstreamer`](https://github.com/EdgeFirstAI/nnstreamer) | NNStreamer consumer (`HalDmaBufAPI` + VX delegate path in `tensor_filter_tensorflow_lite.cc`) |
+| [`EdgeFirstAI/hal`](https://github.com/EdgeFirstAI/hal) | HAL ABI specification (`ARCHITECTURE.md`), `edgefirst/hal.h` type definitions |
 
 ## References
 
-- [Linux DMA-BUF Documentation](https://docs.kernel.org/driver-api/dma-buf.html)
+- [Linux DMA-BUF Documentation](https://www.kernel.org/doc/html/latest/driver-api/dma-buf.html)
 - [V4L2 DMABUF API](https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/dmabuf.html)
-- [EdgeFirst tim-vx-imx](https://github.com/EdgeFirstAI/tim-vx-imx) - `edgefirst-dmabuf` branch
+- [EdgeFirst TIM-VX fork](https://github.com/EdgeFirstAI/tim-vx-imx) — `edgefirst-dmabuf` branch
+- [EdgeFirst HAL ARCHITECTURE.md](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md) — Delegate DMA-BUF Framework
