@@ -1,0 +1,35 @@
+{
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "spdxVersion": "SPDX-2.3",
+  "creationInfo": {
+    "created": "2026-06-02T03:00:18Z",
+    "creators": [
+      "Organization: NXP"
+    ],
+    "licenseListVersion": "3.26"
+  },
+  "name": "tflite-vx-delegate-imx-lf-6.18.20-2.0.0",
+  "dataLicense": "CC0-1.0",
+  "documentNamespace": "https://nxp.com/spdx/261eb040-ede5-474a-8d7e-7b8c9200c48a",
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-package-261eb040-ede5-474a-8d7e-7b8c9200c48a",
+      "name": "tflite-vx-delegate-imx",
+      "versionInfo": "lf-6.18.20-2.0.0",
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "downloadLocation": "https://github.com/nxp-imx/tflite-vx-delegate-imx -b lf-6.18.20-2.0.0",
+      "originator": "Organization: NXP",
+      "supplier": "NOASSERTION",
+      "externalRefs": [],
+      "filesAnalyzed": false
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-package-261eb040-ede5-474a-8d7e-7b8c9200c48a"
+    }
+  ]
+}
