@@ -25,11 +25,12 @@
 #include "delegate_main.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 #include <vector>
 
 #include "op_map.h"
@@ -359,15 +360,34 @@ std::vector<std::shared_ptr<tim::vx::Tensor>> MapIndexesToTensors(
 
 }  // namespace
 
-// Current DerivedDelegateData — used by VxDelegateGetInstance() so that
+// Live delegate instances — used by VxDelegateGetInstance() so that
 // callers who only have the TfLiteExternalDelegate wrapper (not the inner
-// DerivedDelegateData*) can still reach the DMA-BUF API.
-static std::atomic<vx::delegate::DerivedDelegateData*> g_current_vx_delegate{nullptr};
+// DerivedDelegateData*) can still reach the DMA-BUF API. The thread-local
+// last-created pointer keeps concurrent per-worker delegate creation
+// unambiguous: each worker resolves the delegate it created on its own
+// thread. The registry guards against ever returning a deleted instance
+// (a sibling thread may have destroyed it). Mirrors the Neutron
+// delegate's per-instance registry semantics (EDGEAI-1188 / EDGEAI-1435).
+static std::mutex g_vx_instances_mutex;
+static std::unordered_set<vx::delegate::DerivedDelegateData*> g_vx_instances;
+static vx::delegate::DerivedDelegateData* g_vx_last = nullptr;
+static thread_local vx::delegate::DerivedDelegateData* tl_vx_last = nullptr;
 
 extern "C" {
 TfLiteDelegate* VxDelegateGetInstance(void) {
-  return reinterpret_cast<TfLiteDelegate*>(
-      g_current_vx_delegate.load(std::memory_order_acquire));
+  std::lock_guard<std::mutex> lock(g_vx_instances_mutex);
+  if (tl_vx_last != nullptr &&
+      g_vx_instances.find(tl_vx_last) != g_vx_instances.end()) {
+    return reinterpret_cast<TfLiteDelegate*>(tl_vx_last);
+  }
+  if (g_vx_last != nullptr &&
+      g_vx_instances.find(g_vx_last) != g_vx_instances.end()) {
+    return reinterpret_cast<TfLiteDelegate*>(g_vx_last);
+  }
+  if (g_vx_instances.size() == 1) {
+    return reinterpret_cast<TfLiteDelegate*>(*g_vx_instances.begin());
+  }
+  return nullptr;
 }
 }  // extern "C"
 
@@ -391,8 +411,12 @@ TfLiteDelegate* VxDelegateCreate(const VxDelegateOptions* options) {
 void VxDelegateDelete(TfLiteDelegate* delegate) {
   if (delegate == nullptr) return;
   auto derivedDelegate = reinterpret_cast<DerivedDelegateData*>(delegate);
-  g_current_vx_delegate.compare_exchange_strong(
-      derivedDelegate, nullptr, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(g_vx_instances_mutex);
+    g_vx_instances.erase(derivedDelegate);
+    if (g_vx_last == derivedDelegate) g_vx_last = nullptr;
+    if (tl_vx_last == derivedDelegate) tl_vx_last = nullptr;
+  }
   delete derivedDelegate;
   delegate = nullptr;
 }
@@ -458,7 +482,12 @@ TfLiteDelegate* Delegate::Create(const VxDelegateOptions* options) {
     }
   }
   
-  g_current_vx_delegate.store(delegate, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(g_vx_instances_mutex);
+    g_vx_instances.insert(delegate);
+    g_vx_last = delegate;
+    tl_vx_last = delegate;
+  }
   return reinterpret_cast<TfLiteDelegate*>(delegate);
 }
 
