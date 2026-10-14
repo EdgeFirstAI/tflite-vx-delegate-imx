@@ -5,14 +5,15 @@
 | Field | Value |
 |-------|-------|
 | **Author** | Sébastien Taylor <sebastien@au-zone.com> |
-| **Version** | 1.7.0 |
-| **Date** | 2026-03-27 |
+| **Version** | 1.8.0 |
+| **Date** | 2026-10-14 |
 | **Status** | Test Release |
 
 ### Changelog
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 1.8.0 | 2026-10-14 | Export mode allocates from galcore; GPU/NPU shared-buffer CMA leak and its troubleshooting documented |
 | 1.7.0 | 2026-03-27 | Full API reference, HAL API section, export mode documented, buffer cycling technical analysis, cross-references |
 | 1.6.0 | 2026-02-13 | DRM PRIME import, cache sync documentation, buffer cycling investigation |
 
@@ -25,7 +26,7 @@ This document describes the DMA-BUF zero-copy API for the TFLite VX Delegate on 
 ### Key Features
 
 - **Zero-copy input and output**: NPU reads and writes CMA DMA-BUFs directly
-- **Export mode**: Delegate allocates buffers on behalf of the caller
+- **Export mode**: Delegate allocates buffers on behalf of the caller, from galcore where it is the GPU/NPU driver so the GPU and NPU share one buffer
 - **DRM PRIME auto-attach**: `DMA_BUF_IOCTL_SYNC` is automatically effective on cached CMA heaps
 - **HAL API**: Backend-agnostic `hal_dmabuf_*` symbols for cross-delegate portability
 - **CameraAdaptor**: NPU-injected format conversion, see [CAMERAADAPTOR.md](CAMERAADAPTOR.md)
@@ -103,7 +104,7 @@ flowchart LR
     subgraph Export["Export mode (delegate-owned fd)"]
         RE["VxDelegateRequestDmaBuf(size, &desc)"]
         BE["VxDelegateBindDmaBufToTensor(handle, idx)"]
-        UE["delegate allocates from /dev/dma_heap/linux,cma<br/>desc.fd → mmap for CPU access"]
+        UE["delegate allocates from galcore (renderD128)<br/>or /dev/dma_heap/linux,cma<br/>desc.fd → mmap for CPU access"]
         RE --> BE
         RE --> UE
     end
@@ -187,7 +188,7 @@ TfLiteDelegate* delegate = VxDelegateCreate(&options);
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `VxDelegateIsDmaBufSupported` | `(TfLiteDelegate*) → bool` | Returns true if `/dev/dma_heap` was opened successfully. |
+| `VxDelegateIsDmaBufSupported` | `(TfLiteDelegate*) → bool` | Returns true if galcore is the render node or a `/dev/dma_heap` device was opened. Either one is enough; the heap is the allocation fallback. |
 
 ### Import Mode (Client-Owned Buffers)
 
@@ -201,7 +202,7 @@ TfLiteDelegate* delegate = VxDelegateCreate(&options);
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `VxDelegateRequestDmaBuf` | `(delegate, size, align, ownership, desc*) → TfLiteBufferHandle` | Allocate from `/dev/dma_heap/linux,cma` with 64-byte NPU alignment. Fills `desc.fd` and `desc.size`. Caller must provide `desc.size` (from `tensor->bytes` after `AllocateTensors()`). |
+| `VxDelegateRequestDmaBuf` | `(delegate, size, align, ownership, desc*) → TfLiteBufferHandle` | Allocate a contiguous, uncached buffer from galcore, or from `/dev/dma_heap/linux,cma` where galcore is not available (see [Export Mode Allocation](#export-mode-allocation)), with 64-byte NPU alignment. Fills `desc.fd` and `desc.size`. Caller must provide `desc.size` (from `tensor->bytes` after `AllocateTensors()`). |
 | `VxDelegateReleaseDmaBuf` | `(delegate, handle) → TfLiteStatus` | Release delegate-allocated buffer. Closes the fd. |
 
 ### Tensor Binding
@@ -276,6 +277,18 @@ typedef struct hal_camera_adaptor_format_info {
 | `hal_camera_adaptor_get_format_info(delegate, format, info*, info_size)` | `int` 0/−1 | Fills channels and FourCC. |
 
 **errno values**: `EINVAL` (bad args), `ENOTSUP` (dmabuf not enabled), `ERANGE` (tensor index not found), `EIO` (ioctl failure).
+
+---
+
+## Export Mode Allocation
+
+`VxDelegateRequestDmaBuf` allocates from galcore, the Vivante GPU/NPU kernel driver, when `/dev/dri/renderD128` belongs to it (DRM driver name `vivante`). The buffer is created with `DRM_IOCTL_VIV_GEM_CREATE` (physically contiguous) and exported as a DMA-BUF with `DRM_IOCTL_PRIME_HANDLE_TO_FD`. On other systems it falls back to `/dev/dma_heap/linux,cma` with a DRM PRIME attachment.
+
+galcore shares a buffer it exported itself: every importer of the fd, the GPU through EGL and the NPU through OpenVX, references the same video memory node. A DMA-BUF from another exporter, such as the CMA heap, is instead wrapped as a separate node for each importer. When the GPU and the NPU both import the same foreign buffer in one process, galcore fails to release one of those nodes unless the NPU import is created first and released last. The leaked node keeps its CMA pages, and the DMA-BUF stays alive with no owning process (`/sys/kernel/debug/dma_buf/bufinfo`), until the board reboots. A GPU letterbox into a CameraAdaptor input followed by NPU inference is exactly that pattern, so allocating from galcore is what keeps repeated runs from exhausting CMA.
+
+galcore's exported DMA-BUFs implement no CPU-access hooks, so `DMA_BUF_IOCTL_SYNC` does nothing on them. They are allocated uncached, which keeps CPU and device views coherent without sync.
+
+The same limitation applies to import mode. A client buffer from the CMA heap that is also imported by the GPU will leak in the same way. Clients that share a buffer between the GPU and the NPU should allocate it from galcore.
 
 ---
 
@@ -572,7 +585,7 @@ if (tensor->attr.vsi_memory_type != VSI_MEMORY_TYPE_DMABUF) {
 | `vx_delegate_dmabuf.h` | Public C API — `VxDelegate*` and `VxCameraAdaptor*` functions |
 | `vx_delegate_dmabuf.cc` | API implementation — routes to `DmaBufManager` and `camera_adaptor` |
 | `dmabuf_manager.h` | `DmaBufManager` class + `DrmAttachment` RAII class + `DmaBufEntry` struct |
-| `dmabuf_manager.cc` | Buffer registration, CMA allocation, DRM PRIME attach, TIM-VX tensor creation, cache sync |
+| `dmabuf_manager.cc` | Buffer registration, galcore/CMA allocation, DRM PRIME attach, TIM-VX tensor creation, cache sync |
 | `hal_dmabuf.h` | Self-contained HAL C header — `hal_delegate_t`, `hal_dmabuf_*`, `hal_camera_adaptor_*` |
 | `hal_dmabuf.cc` | HAL implementation — wraps `VxDelegate*`, exports with `visibility("default")` |
 | `delegate_main.h` | `DerivedDelegateData` definition, `DmaBufManager` ownership, `VxDelegateOptions` |
@@ -583,6 +596,10 @@ if (tensor->attr.vsi_memory_type != VSI_MEMORY_TYPE_DMABUF) {
 ---
 
 ## Troubleshooting
+
+### CMA Free Memory Shrinks Across Runs
+
+Check `sudo cat /sys/kernel/debug/dma_buf/bufinfo` for objects attached to the GPU/NPU device with no process holding them (sizes are decimal bytes). These are buffers that the GPU and NPU both imported from a non-galcore exporter; see [Export Mode Allocation](#export-mode-allocation). Allocate shared buffers from galcore. A reboot frees the ones already leaked.
 
 ### `DMA_BUF_IOCTL_SYNC` Has No Effect
 

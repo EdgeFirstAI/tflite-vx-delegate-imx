@@ -39,19 +39,25 @@ namespace vx {
 namespace delegate {
 
 /**
- * Holds a DRM GEM handle that keeps a persistent dma_buf_attach alive.
+ * Holds a GEM handle on the Vivante (galcore) DRM render node.
  *
- * On cached CMA heaps (linux,cma), the kernel's begin_cpu_access iterates
- * over buffer->attachments to perform cache maintenance. Without any active
- * attachments, DMA_BUF_IOCTL_SYNC is a no-op — no cache invalidation or
- * flush occurs.
+ * Two roles, both released by closing the handle and the DRM fd:
  *
- * By importing the DMA-buf fd through the GPU DRM driver
- * (DRM_IOCTL_PRIME_FD_TO_HANDLE), the driver creates a persistent
- * dma_buf_attach that makes DMA_BUF_IOCTL_SYNC effective.
+ * - Owner of a galcore-allocated buffer (CreateGalcoreBuffer). galcore
+ *   exports it with its own dma_buf_ops, so every later import of the fd,
+ *   by the GPU (EGL) or by the NPU (OpenVX), references this one video
+ *   memory node. A dma-buf from another exporter (e.g. the CMA heap) is
+ *   instead wrapped as a separate node per importer, and when those wraps
+ *   overlap in one process galcore fails to release one of them, keeping
+ *   its CMA pages and dma-buf reference until reboot.
+ *
+ * - Cache-maintenance attachment for a foreign dma-buf (Create). On cached
+ *   CMA heaps the kernel's begin_cpu_access iterates over
+ *   buffer->attachments; without one, DMA_BUF_IOCTL_SYNC is a no-op.
+ *   Importing the fd with DRM_IOCTL_PRIME_FD_TO_HANDLE creates a persistent
+ *   attachment that makes the sync effective.
  *
  * The GEM handle and DRM fd must remain open for the buffer's lifetime.
- * Closing either removes the attachment and makes sync a no-op again.
  */
 class DrmAttachment {
  public:
@@ -60,6 +66,27 @@ class DrmAttachment {
    * Returns nullptr if /dev/dri/renderD128 is not available.
    */
   static std::unique_ptr<DrmAttachment> Create(int dmabuf_fd);
+
+  /**
+   * Allocate a physically contiguous, uncached buffer from galcore and
+   * export it as a DMA-BUF.
+   *
+   * galcore's exported dma-bufs implement no CPU-access hooks, so the
+   * buffer is uncached to stay coherent without DMA_BUF_IOCTL_SYNC.
+   *
+   * @param size Buffer size in bytes
+   * @param dmabuf_fd Receives the exported DMA-BUF fd; the caller owns it
+   * @return The owning attachment, or nullptr when the render node is not
+   *         galcore or the allocation fails
+   */
+  static std::unique_ptr<DrmAttachment> CreateGalcoreBuffer(size_t size,
+                                                            int* dmabuf_fd);
+
+  /**
+   * True when the render node belongs to galcore, so CreateGalcoreBuffer
+   * can allocate.
+   */
+  static bool IsGalcoreAvailable();
 
   ~DrmAttachment();
 
@@ -85,7 +112,7 @@ struct DmaBufEntry {
   std::shared_ptr<tim::vx::Tensor> tim_tensor;  // TIM-VX tensor (created lazily)
   bool is_input;                   // True if bound to input tensor
   bool is_output;                  // True if bound to output tensor
-  std::unique_ptr<DrmAttachment> drm_attachment;  // Keeps DMA_BUF_IOCTL_SYNC effective
+  std::unique_ptr<DrmAttachment> drm_attachment;  // Owner or sync attach
 };
 
 /**
@@ -93,7 +120,8 @@ struct DmaBufEntry {
  *
  * This class handles:
  * - Registration of externally-allocated dmabufs (import mode)
- * - Allocation of dmabufs from dma_heap (export mode)
+ * - Allocation of dmabufs from galcore, or from dma_heap where galcore is
+ *   not the render node (export mode)
  * - Cache synchronization for CPU/NPU coherency
  * - Binding dmabufs to TIM-VX tensors for zero-copy inference
  */
@@ -103,16 +131,17 @@ class DmaBufManager {
   ~DmaBufManager();
 
   /**
-   * Initialize the manager. Opens the dma_heap device.
+   * Initialize the manager. Probes galcore and opens the dma_heap device;
+   * either one is enough, the heap serves as the allocation fallback.
    * @param heap_path Path to dma_heap device (default: /dev/dma_heap/linux,cma)
-   * @return true if initialization succeeded
+   * @return true if galcore or a dma_heap device is usable
    */
   bool Initialize(const char* heap_path = nullptr);
 
   /**
    * Check if DMA-BUF is supported on this platform.
    */
-  bool IsSupported() const { return dma_heap_fd_ >= 0; }
+  bool IsSupported() const { return galcore_available_ || dma_heap_fd_ >= 0; }
 
   // === Import Mode (client-provided buffers) ===
 
@@ -134,7 +163,7 @@ class DmaBufManager {
   // === Export Mode (delegate-allocated buffers) ===
 
   /**
-   * Allocate a DMA-BUF from the heap.
+   * Allocate a DMA-BUF, from galcore when available, else from the heap.
    * @param size Required size
    * @param alignment Required alignment (0 for default)
    * @param ownership Who owns the buffer
@@ -240,10 +269,12 @@ class DmaBufManager {
 
  private:
   void SyncBuffer(int fd, bool start, bool for_write);
+  bool OpenHeap(const char* heap_path);
   int AllocateFromHeap(size_t size);
   std::unique_ptr<DrmAttachment> CreateDrmAttachment(int dmabuf_fd);
 
   int dma_heap_fd_;                                  // /dev/dma_heap fd
+  bool galcore_available_;                           // galcore render node
   std::map<TfLiteBufferHandle, DmaBufEntry> entries_;
   TfLiteBufferHandle next_handle_;
   mutable std::mutex mutex_;
