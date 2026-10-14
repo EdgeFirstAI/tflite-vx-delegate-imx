@@ -72,7 +72,53 @@ constexpr unsigned long kDrmIoctlPrimeFdToHandle =
 constexpr unsigned long kDrmIoctlGemClose =
     (1UL << 30) | (sizeof(DrmGemClose) << 16) | ('d' << 8) | 0x09;
 
+// DRM_IOCTL_PRIME_HANDLE_TO_FD = _IOWR('d', 0x2d, struct drm_prime_handle)
+constexpr unsigned long kDrmIoctlPrimeHandleToFd =
+    (3UL << 30) | (sizeof(DrmPrimeHandle) << 16) | ('d' << 8) | 0x2d;
+
+struct DrmVersion {
+  int major;
+  int minor;
+  int patchlevel;
+  size_t name_len;
+  char* name;
+  size_t date_len;
+  char* date;
+  size_t desc_len;
+  char* desc;
+};
+
+// DRM_IOCTL_VERSION = _IOWR('d', 0x00, struct drm_version)
+constexpr unsigned long kDrmIoctlVersion =
+    (3UL << 30) | (sizeof(DrmVersion) << 16) | ('d' << 8) | 0x00;
+
+// galcore's GEM create (gc_hal_drm.h). Driver-private ioctl numbers are only
+// meaningful once the node has been identified as galcore.
+struct VivGemCreate {
+  uint64_t size;
+  uint32_t flags;
+  uint32_t handle;
+};
+
+constexpr uint32_t kVivGemContiguous = 1u << 0;
+
+// DRM_IOCTL_VIV_GEM_CREATE = DRM_IOWR(DRM_COMMAND_BASE + 0x00, ...)
+constexpr unsigned long kDrmIoctlVivGemCreate =
+    (3UL << 30) | (sizeof(VivGemCreate) << 16) | ('d' << 8) | 0x40;
+
 const char* kDrmRenderNode = "/dev/dri/renderD128";
+const char* kGalcoreDrmName = "vivante";
+
+bool IsGalcoreNode(int drm_fd) {
+  char name[32] = {};
+  DrmVersion version = {};
+  version.name_len = sizeof(name) - 1;
+  version.name = name;
+  if (ioctl(drm_fd, kDrmIoctlVersion, &version) < 0) {
+    return false;
+  }
+  return strcmp(name, kGalcoreDrmName) == 0;
+}
 
 // Default paths for dma_heap devices
 const char* kDmaHeapPaths[] = {
@@ -123,6 +169,57 @@ std::unique_ptr<DrmAttachment> DrmAttachment::Create(int dmabuf_fd) {
 
   return std::unique_ptr<DrmAttachment>(
       new DrmAttachment(drm_fd, prime.handle));
+}
+
+std::unique_ptr<DrmAttachment> DrmAttachment::CreateGalcoreBuffer(
+    size_t size, int* dmabuf_fd) {
+  *dmabuf_fd = -1;
+
+  int drm_fd = open(kDrmRenderNode, O_RDWR | O_CLOEXEC);
+  if (drm_fd < 0) {
+    return nullptr;
+  }
+  if (!IsGalcoreNode(drm_fd)) {
+    close(drm_fd);
+    return nullptr;
+  }
+
+  VivGemCreate create = {};
+  create.size = size;
+  create.flags = kVivGemContiguous;
+  if (ioctl(drm_fd, kDrmIoctlVivGemCreate, &create) < 0) {
+    TFLITE_LOG_PROD(tflite::TFLITE_LOG_WARNING,
+                    "DrmAttachment: galcore GEM create of %zu bytes failed: %s",
+                    size,
+                    strerror(errno));
+    close(drm_fd);
+    return nullptr;
+  }
+
+  // Owns the GEM handle from here, so every failure path below releases it.
+  std::unique_ptr<DrmAttachment> owner(
+      new DrmAttachment(drm_fd, create.handle));
+
+  DrmPrimeHandle prime = {};
+  prime.handle = create.handle;
+  prime.flags = O_RDWR | O_CLOEXEC;
+  if (ioctl(drm_fd, kDrmIoctlPrimeHandleToFd, &prime) < 0) {
+    TFLITE_LOG_PROD(
+        tflite::TFLITE_LOG_WARNING,
+        "DrmAttachment: PRIME_HANDLE_TO_FD failed for GEM handle %u: %s",
+        create.handle,
+        strerror(errno));
+    return nullptr;
+  }
+
+  *dmabuf_fd = prime.fd;
+  TFLITE_LOG_PROD(
+      tflite::TFLITE_LOG_INFO,
+      "DrmAttachment: allocated %zu bytes from galcore as GEM handle %u, fd=%d",
+      size,
+      create.handle,
+      prime.fd);
+  return owner;
 }
 
 DmaBufManager::DmaBufManager()
@@ -260,9 +357,15 @@ TfLiteBufferHandle DmaBufManager::AllocateBuffer(size_t size, size_t alignment,
     size = (size + alignment - 1) & ~(alignment - 1);
   }
 
-  int fd = AllocateFromHeap(size);
-  if (fd < 0) {
-    return kTfLiteNullBufferHandle;
+  int fd = -1;
+  std::unique_ptr<DrmAttachment> drm_attachment =
+      DrmAttachment::CreateGalcoreBuffer(size, &fd);
+  if (!drm_attachment) {
+    fd = AllocateFromHeap(size);
+    if (fd < 0) {
+      return kTfLiteNullBufferHandle;
+    }
+    drm_attachment = CreateDrmAttachment(fd);
   }
 
   TfLiteBufferHandle handle = next_handle_++;
@@ -276,7 +379,7 @@ TfLiteBufferHandle DmaBufManager::AllocateBuffer(size_t size, size_t alignment,
   entry.tim_tensor = nullptr;
   entry.is_input = false;
   entry.is_output = false;
-  entry.drm_attachment = CreateDrmAttachment(fd);
+  entry.drm_attachment = std::move(drm_attachment);
 
   entries_[handle] = std::move(entry);
 
