@@ -653,22 +653,14 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
     // When CameraAdaptor is configured for a tensor:
     // - Create the model's expected tensor as TRANSIENT (Slice will write to it)
     // - CameraAdaptor creates the actual INPUT tensor with camera format
+    std::set<int> camera_adaptor_inputs;
     for (int tensor_idx : op_data.subgraph_inputs) {
       if (-1 != tensor_idx && tensors_[tensor_idx].get() == nullptr) {
         const auto tensor = &(context->tensors[tensor_idx]);
 
-        // Check if CameraAdaptor is configured for this tensor
-        bool has_camera_adaptor = false;
-        if (parent_delegate_) {
-          auto config_it = parent_delegate_->camera_adaptor_configs.find(tensor_idx);
-          if (config_it != parent_delegate_->camera_adaptor_configs.end()) {
-            edgefirst::camera_adaptor::CameraAdaptor adaptor(config_it->second);
-            has_camera_adaptor = adaptor.RequiresConversion();
-          }
-        }
-
         // If CameraAdaptor is configured, create as TRANSIENT (Slice outputs to it)
-        if (has_camera_adaptor) {
+        if (UsesCameraAdaptor(tensor_idx)) {
+          camera_adaptor_inputs.insert(tensor_idx);
           tensors_[tensor_idx] =
               CreateTensor(graph_, tensor, tim::vx::TensorAttribute::TRANSIENT, {});
           TFLITE_LOG(TFLITE_LOG_INFO,
@@ -709,7 +701,7 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
         if (config_it != parent_delegate_->camera_adaptor_configs.end()) {
           edgefirst::camera_adaptor::CameraAdaptor adaptor(config_it->second);
 
-          if (adaptor.RequiresConversion()) {
+          if (camera_adaptor_inputs.count(tensor_idx)) {
             // Get DMA-BUF fd if available
             int dmabuf_fd = -1;
 #ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
@@ -1296,6 +1288,34 @@ TfLiteStatus Delegate::InvalidateGraph() {
   dmabuf_zerocopy_logged_.clear();
 
   return kTfLiteOk;
+}
+
+bool Delegate::UsesCameraAdaptor(int tensor_idx) const {
+  if (!parent_delegate_) {
+    return false;
+  }
+  auto config_it = parent_delegate_->camera_adaptor_configs.find(tensor_idx);
+  if (config_it == parent_delegate_->camera_adaptor_configs.end()) {
+    return false;
+  }
+  edgefirst::camera_adaptor::CameraAdaptor adaptor(config_it->second);
+  if (!adaptor.RequiresConversion()) {
+    return false;
+  }
+#ifdef VX_CREATE_TENSOR_SUPPORT_PHYSICAL
+  if (dmabuf_manager_ && dmabuf_enabled_ &&
+      dmabuf_manager_->FindByTensorIndex(tensor_idx) !=
+          kTfLiteNullBufferHandle) {
+    return true;
+  }
+#endif
+  // The configuration is kept so a later DMA-BUF bind followed by
+  // InvalidateGraph() compiles the adaptor in.
+  TFLITE_LOG_PROD(TFLITE_LOG_WARNING,
+                  "CameraAdaptor: input %d has no DMA-BUF bound; adaptor not "
+                  "applied, the input is copied in the model format",
+                  tensor_idx);
+  return false;
 }
 
 bool Delegate::CheckAndClearInvalidation() {

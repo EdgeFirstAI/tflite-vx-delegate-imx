@@ -164,6 +164,12 @@ class Delegate {
   std::map<std::shared_ptr<tim::vx::Tensor>,std::shared_ptr<tim::vx::Tensor>> map_BroadcastTo;
 
  private:
+  // True when input tensor_idx gets the CameraAdaptor preprocessing. The
+  // adaptor's input tensor is in the camera format (e.g. RGBA) while the
+  // TFLite input tensor is sized for the model format, so the camera data
+  // can only reach the graph through a DMA-BUF bound to that input.
+  bool UsesCameraAdaptor(int tensor_idx) const;
+
   struct OperationDataType {
     int builtin_code;
     std::string custom_name;
