@@ -171,6 +171,16 @@ std::unique_ptr<DrmAttachment> DrmAttachment::Create(int dmabuf_fd) {
       new DrmAttachment(drm_fd, prime.handle));
 }
 
+bool DrmAttachment::IsGalcoreAvailable() {
+  int drm_fd = open(kDrmRenderNode, O_RDWR | O_CLOEXEC);
+  if (drm_fd < 0) {
+    return false;
+  }
+  bool galcore = IsGalcoreNode(drm_fd);
+  close(drm_fd);
+  return galcore;
+}
+
 std::unique_ptr<DrmAttachment> DrmAttachment::CreateGalcoreBuffer(
     size_t size, int* dmabuf_fd) {
   *dmabuf_fd = -1;
@@ -223,7 +233,7 @@ std::unique_ptr<DrmAttachment> DrmAttachment::CreateGalcoreBuffer(
 }
 
 DmaBufManager::DmaBufManager()
-    : dma_heap_fd_(-1), next_handle_(1) {}
+    : dma_heap_fd_(-1), galcore_available_(false), next_handle_(1) {}
 
 DmaBufManager::~DmaBufManager() {
   // Close delegate-owned buffers
@@ -243,30 +253,49 @@ DmaBufManager::~DmaBufManager() {
 bool DmaBufManager::Initialize(const char* heap_path) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  if (dma_heap_fd_ >= 0) {
+  if (IsSupported()) {
     return true;  // Already initialized
   }
 
+  galcore_available_ = DrmAttachment::IsGalcoreAvailable();
+  if (galcore_available_) {
+    TFLITE_LOG_PROD(tflite::TFLITE_LOG_INFO,
+                    "DmaBufManager: allocating from galcore (%s)",
+                    kDrmRenderNode);
+  }
+
+  if (!OpenHeap(heap_path)) {
+    if (!galcore_available_) {
+      TFLITE_LOG_PROD(tflite::TFLITE_LOG_WARNING,
+                      "DmaBufManager: neither galcore nor a dma_heap device "
+                      "is available");
+      return false;
+    }
+    TFLITE_LOG_PROD(tflite::TFLITE_LOG_INFO,
+                    "DmaBufManager: no dma_heap device; galcore only");
+  }
+  return true;
+}
+
+bool DmaBufManager::OpenHeap(const char* heap_path) {
   // Try specified path first, then defaults
   if (heap_path && heap_path[0] != '\0') {
     dma_heap_fd_ = open(heap_path, O_RDWR);
     if (dma_heap_fd_ >= 0) {
-      TFLITE_LOG_PROD(tflite::TFLITE_LOG_INFO, "DmaBufManager: opened %s", heap_path);
+      TFLITE_LOG_PROD(
+          tflite::TFLITE_LOG_INFO, "DmaBufManager: opened %s", heap_path);
       return true;
     }
   }
 
-  // Try default paths
   for (const char** path = kDmaHeapPaths; *path != nullptr; ++path) {
     dma_heap_fd_ = open(*path, O_RDWR);
     if (dma_heap_fd_ >= 0) {
-      TFLITE_LOG_PROD(tflite::TFLITE_LOG_INFO, "DmaBufManager: opened %s", *path);
+      TFLITE_LOG_PROD(
+          tflite::TFLITE_LOG_INFO, "DmaBufManager: opened %s", *path);
       return true;
     }
   }
-
-  TFLITE_LOG_PROD(tflite::TFLITE_LOG_WARNING,
-                  "DmaBufManager: no dma_heap device available");
   return false;
 }
 

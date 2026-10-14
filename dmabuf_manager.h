@@ -82,6 +82,12 @@ class DrmAttachment {
   static std::unique_ptr<DrmAttachment> CreateGalcoreBuffer(size_t size,
                                                             int* dmabuf_fd);
 
+  /**
+   * True when the render node belongs to galcore, so CreateGalcoreBuffer
+   * can allocate.
+   */
+  static bool IsGalcoreAvailable();
+
   ~DrmAttachment();
 
   DrmAttachment(const DrmAttachment&) = delete;
@@ -125,16 +131,17 @@ class DmaBufManager {
   ~DmaBufManager();
 
   /**
-   * Initialize the manager. Opens the dma_heap device.
+   * Initialize the manager. Probes galcore and opens the dma_heap device;
+   * either one is enough, the heap serves as the allocation fallback.
    * @param heap_path Path to dma_heap device (default: /dev/dma_heap/linux,cma)
-   * @return true if initialization succeeded
+   * @return true if galcore or a dma_heap device is usable
    */
   bool Initialize(const char* heap_path = nullptr);
 
   /**
    * Check if DMA-BUF is supported on this platform.
    */
-  bool IsSupported() const { return dma_heap_fd_ >= 0; }
+  bool IsSupported() const { return galcore_available_ || dma_heap_fd_ >= 0; }
 
   // === Import Mode (client-provided buffers) ===
 
@@ -262,10 +269,12 @@ class DmaBufManager {
 
  private:
   void SyncBuffer(int fd, bool start, bool for_write);
+  bool OpenHeap(const char* heap_path);
   int AllocateFromHeap(size_t size);
   std::unique_ptr<DrmAttachment> CreateDrmAttachment(int dmabuf_fd);
 
   int dma_heap_fd_;                                  // /dev/dma_heap fd
+  bool galcore_available_;                           // galcore render node
   std::map<TfLiteBufferHandle, DmaBufEntry> entries_;
   TfLiteBufferHandle next_handle_;
   mutable std::mutex mutex_;

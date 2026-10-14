@@ -188,7 +188,7 @@ TfLiteDelegate* delegate = VxDelegateCreate(&options);
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `VxDelegateIsDmaBufSupported` | `(TfLiteDelegate*) → bool` | Returns true if `/dev/dma_heap` was opened successfully. |
+| `VxDelegateIsDmaBufSupported` | `(TfLiteDelegate*) → bool` | Returns true if galcore is the render node or a `/dev/dma_heap` device was opened. Either one is enough; the heap is the allocation fallback. |
 
 ### Import Mode (Client-Owned Buffers)
 
