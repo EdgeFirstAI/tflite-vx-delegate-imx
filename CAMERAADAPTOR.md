@@ -120,6 +120,8 @@ VxDelegateBindDmaBufToTensor(delegate, handle, input_tensor_idx);
 interpreter->ModifyGraphWithDelegate(delegate);
 ```
 
+The conversion is applied only to inputs that have a DMA-BUF bound when the graph is compiled. The TFLite input tensor keeps the model's shape (for example 640x640x3), so camera-format data such as RGBA cannot be copied through it. If no DMA-BUF is bound to the input, the delegate ignores the CameraAdaptor configuration, logs a warning, and runs the model on the TFLite input tensor, which must then hold data in the model's format (see the `copy-rgba` mode of `camera_adaptor_test`, which drops alpha on the CPU). Binding a DMA-BUF later and calling `VxDelegateInvalidateGraph()` applies the conversion on the next `Invoke()`.
+
 ### C API Reference
 
 ```c

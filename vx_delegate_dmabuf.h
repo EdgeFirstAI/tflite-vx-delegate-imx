@@ -306,6 +306,13 @@ TfLiteBufferHandle VxDelegateGetActiveBuffer(TfLiteDelegate* delegate,
  * model-expected formats (e.g., RGBA -> RGB). The conversion operations are
  * injected into the TIM-VX graph and run on the NPU.
  *
+ * The conversion is applied only to inputs that have a DMA-BUF bound when the
+ * graph is compiled, because the TFLite input tensor keeps the model's shape
+ * and cannot carry camera-format data. An input without a DMA-BUF ignores the
+ * configuration (a warning is logged) and must be filled through the TFLite
+ * input tensor in the model's format. Binding a DMA-BUF later and calling
+ * VxDelegateInvalidateGraph() applies the conversion on the next Invoke().
+ *
  * This is the runtime counterpart to the EdgeFirst Python CameraAdaptor library.
  */
 
