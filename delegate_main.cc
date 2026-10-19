@@ -52,6 +52,13 @@
 using namespace tflite;
 namespace {
 
+// Serializes TIM-VX graph build/compile and teardown across all delegate
+// instances in the process. The driver's OpenVX state is shared, and two
+// graphs compiling concurrently on different threads produce graphs that
+// run without error but return corrupted outputs. Inference on already
+// compiled graphs is not serialized.
+std::mutex g_vx_compile_mutex;
+
 TfLiteRegistration DelegateNodeRegistration() {
   TfLiteRegistration r;
 
@@ -80,6 +87,8 @@ TfLiteRegistration DelegateNodeRegistration() {
   r.free = [](TfLiteContext* context, void* buffer) -> void {
     std::unique_ptr<vx::delegate::OpData> op_data(
         reinterpret_cast<vx::delegate::OpData*>(buffer));
+    // Destroying the Delegate releases its TIM-VX graph and context.
+    std::lock_guard<std::mutex> compile_lock(g_vx_compile_mutex);
     op_data->delegate = nullptr;
   };
 
@@ -372,13 +381,6 @@ static std::mutex g_vx_instances_mutex;
 static std::unordered_set<vx::delegate::DerivedDelegateData*> g_vx_instances;
 static vx::delegate::DerivedDelegateData* g_vx_last = nullptr;
 static thread_local vx::delegate::DerivedDelegateData* tl_vx_last = nullptr;
-
-// Serializes TIM-VX graph build/compile and teardown across all delegate
-// instances in the process. The driver's OpenVX state is shared, and two
-// graphs compiling concurrently on different threads produce graphs that
-// run without error but return corrupted outputs. Inference on already
-// compiled graphs is not serialized.
-static std::mutex g_vx_compile_mutex;
 
 extern "C" {
 TfLiteDelegate* VxDelegateGetInstance(void) {
