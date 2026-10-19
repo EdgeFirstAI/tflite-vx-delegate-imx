@@ -52,6 +52,13 @@
 using namespace tflite;
 namespace {
 
+// Serializes TIM-VX graph build/compile and teardown across all delegate
+// instances in the process. The driver's OpenVX state is shared, and two
+// graphs compiling concurrently on different threads produce graphs that
+// run without error but return corrupted outputs. Inference on already
+// compiled graphs is not serialized.
+std::mutex g_vx_compile_mutex;
+
 TfLiteRegistration DelegateNodeRegistration() {
   TfLiteRegistration r;
 
@@ -80,6 +87,8 @@ TfLiteRegistration DelegateNodeRegistration() {
   r.free = [](TfLiteContext* context, void* buffer) -> void {
     std::unique_ptr<vx::delegate::OpData> op_data(
         reinterpret_cast<vx::delegate::OpData*>(buffer));
+    // Destroying the Delegate releases its TIM-VX graph and context.
+    std::lock_guard<std::mutex> compile_lock(g_vx_compile_mutex);
     op_data->delegate = nullptr;
   };
 
@@ -643,9 +652,9 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
 #endif
 
   if (!compiled_) {
+    std::lock_guard<std::mutex> compile_lock(g_vx_compile_mutex);
     TFLITE_LOG(TFLITE_LOG_INFO, "Compiling graph, dmabuf_manager_=%p, dmabuf_enabled_=%d",
                dmabuf_manager_.get(), dmabuf_enabled_);
-    // TODO(bo): Handling multi-thread use case
     context_ = tim::vx::Context::Create();
     graph_ = context_->CreateGraph();
 
@@ -1267,6 +1276,7 @@ TfLiteStatus Delegate::SwapDmaBufTensor(int tensor_index, int new_fd) {
 TfLiteStatus Delegate::InvalidateGraph() {
   TFLITE_LOG(TFLITE_LOG_INFO, "InvalidateGraph: clearing compiled state");
 
+  std::lock_guard<std::mutex> compile_lock(g_vx_compile_mutex);
   compiled_ = false;
 
   // Clear graph and context
