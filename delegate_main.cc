@@ -55,9 +55,14 @@ namespace {
 // Serializes TIM-VX graph build/compile and teardown across all delegate
 // instances in the process. The driver's OpenVX state is shared, and two
 // graphs compiling concurrently on different threads produce graphs that
-// run without error but return corrupted outputs. Inference on already
-// compiled graphs is not serialized.
+// run without error but return corrupted outputs.
 std::mutex g_vx_compile_mutex;
+
+// Serializes graph execution across all delegate instances in the process.
+// Two compiled graphs executing concurrently on different threads can return
+// corrupted outputs without reporting an error. The NPU runs one graph at a
+// time, so serializing costs little throughput.
+std::mutex g_vx_run_mutex;
 
 TfLiteRegistration DelegateNodeRegistration() {
   TfLiteRegistration r;
@@ -1139,6 +1144,8 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
 #endif
 
   TFLITE_LOG(TFLITE_LOG_INFO, "Invoking graph");
+  {
+    std::lock_guard<std::mutex> run_lock(g_vx_run_mutex);
 #ifdef MULTI_DEVICE_FEATURE_MODE
     auto executable_set = tim::vx::platform::CreateExecutableSet({executable_, executable_});
     executor_->Submit(executable_set,executable_set);
@@ -1150,6 +1157,7 @@ TfLiteStatus Delegate::Invoke(const OpData& op_data,
       return kTfLiteDelegateError;
     }
 #endif
+  }
 
   for (int tensor_idx : op_data.subgraph_outputs) {
     TfLiteTensor& tf_tensor = context->tensors[tensor_idx];
